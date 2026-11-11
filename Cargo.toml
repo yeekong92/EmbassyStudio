@@ -1,0 +1,31 @@
+[package]
+name = "embassy-studio"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Open-source STM32 project configurator and Embassy code generator"
+repository = "https://github.com/embassy-rs/stm32-data"
+
+[[bin]]
+name = "embassy-studio"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.37"
+egui = "0.37"
+rfd = "0.17"
+# OS-native TLS (SChannel on Windows): uses the system certificate store and needs no C compiler.
+ureq = { version = "3.5", default-features = false, features = ["native-tls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "7"
+anyhow = "1"
+
+[target.'cfg(windows)'.dependencies]
+# AttachConsole, so `--generate` can print from the GUI-subsystem release build.
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
