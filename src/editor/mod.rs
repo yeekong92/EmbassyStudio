@@ -38,6 +38,10 @@ pub struct Editor {
     selected_periph: Option<String>,
     periph_search: String,
     pin_view: pinout::PinView,
+    /// Pinout search (pin names, signals, peripherals, user labels).
+    pin_search: String,
+    /// Open pin popup (left-click function list or right-click label editor).
+    pin_popup: Option<pinout::PinPopup>,
     dirty: bool,
     generate_when_ready: bool,
     preview: Vec<GenFile>,
@@ -60,6 +64,8 @@ impl Editor {
             selected_periph: None,
             periph_search: String::new(),
             pin_view: pinout::PinView::default(),
+            pin_search: String::new(),
+            pin_popup: None,
             dirty: false,
             generate_when_ready: generate,
             preview: Vec::new(),
@@ -185,9 +191,18 @@ impl Editor {
 
         egui::Panel::left("peripherals")
             .resizable(true)
-            .default_size(300.0)
-            .min_size(240.0)
+            .default_size(250.0)
+            .min_size(200.0)
             .show(ui, |ui| self.peripheral_panel(ui, &chip));
+
+        // Configuration of the selected peripheral, to the right of the list.
+        if let Some(p) = self.selected_periph.clone().and_then(|name| chip.peripheral(&name)) {
+            egui::Panel::left("periph_config")
+                .resizable(true)
+                .default_size(330.0)
+                .min_size(260.0)
+                .show(ui, |ui| self.peripheral_config_panel(ui, p));
+        }
 
         if self.tab == Tab::Pinout {
             egui::Panel::right("pin_inspector")

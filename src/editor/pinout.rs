@@ -15,6 +15,30 @@ pub struct PinView {
     pan: Vec2,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PinPopupKind {
+    /// Left-click: list the pin's functions (GPIO modes and alternate functions).
+    Functions,
+    /// Right-click: enter a user label.
+    Label,
+}
+
+/// A popup opened from a pin on the package drawing.
+pub struct PinPopup {
+    gpio: String,
+    kind: PinPopupKind,
+    /// True on the frame the popup was opened.
+    opening: bool,
+    /// Label being edited.
+    label: String,
+}
+
+impl PinPopup {
+    fn new(gpio: String, kind: PinPopupKind, label: String) -> Self {
+        Self { gpio, kind, opening: true, label }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Side {
     Left,
@@ -205,6 +229,54 @@ impl Editor {
         let layout = build_layout(pkg);
         let conflicts = self.conflicts();
 
+        // Search bar: pins, signals, peripherals and user labels.
+        let mut search_enter = false;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.pin_search)
+                    .hint_text("🔍 Find pin or peripheral (PA5, I2C1, LED)  Ctrl+F")
+                    .desired_width(400.0),
+            );
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+                r.request_focus();
+            }
+            search_enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if !self.pin_search.is_empty() && ui.small_button("✕").on_hover_text("Clear search").clicked() {
+                self.pin_search.clear();
+            }
+        });
+        let query: Vec<String> = self.pin_search.split_whitespace().map(|t| t.to_ascii_uppercase()).collect();
+        let hits: Option<Vec<usize>> = (!query.is_empty()).then(|| {
+            layout
+                .pins
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| query.iter().all(|t| self.pin_matches(p, t)))
+                .map(|(i, _)| i)
+                .collect()
+        });
+        if let Some(h) = &hits {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let n = h.len();
+                let color = if n == 0 { theme::WARN } else { theme::TEXT_DIM };
+                ui.label(RichText::new(format!("{n} matching pin{}", if n == 1 { "" } else { "s" })).size(11.5).color(color));
+                // A peripheral name opens its configuration directly.
+                let name = self.pin_search.trim().to_ascii_uppercase();
+                if chip.peripheral(&name).is_some() && ui.small_button(format!("Configure {name}")).clicked() {
+                    self.selected_periph = Some(name);
+                }
+            });
+            if search_enter {
+                if let Some(&i) = h.first() {
+                    self.selected_pin = Some(layout.pins[i].position.clone());
+                }
+            }
+        }
+        let hit_set: std::collections::BTreeSet<usize> = hits.iter().flatten().copied().collect();
+
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, theme::BG);
@@ -275,9 +347,15 @@ impl Editor {
                 hovered = Some(i);
             }
             let selected = self.selected_pin.as_deref() == Some(p.position.as_str());
-            let color = self.pin_color(p, &conflicts);
+            let is_hit = hit_set.contains(&i);
+            let mut color = self.pin_color(p, &conflicts);
+            if hits.is_some() && !is_hit {
+                color = color.gamma_multiply(0.3);
+            }
             let stroke = if selected {
                 Stroke::new(2.0, Color32::WHITE)
+            } else if is_hit {
+                Stroke::new(2.5, theme::WARN)
             } else if is_hover {
                 Stroke::new(1.5, theme::ACCENT)
             } else if p.gpio.as_ref().is_some_and(|g| highlight.contains(g)) {
@@ -325,63 +403,157 @@ impl Editor {
         // Interaction
         if let Some(i) = hovered {
             let p = &layout.pins[i];
+            let label = |s: &Self, g: &String| s.project.pins.get(g).map(|c| c.label.clone()).unwrap_or_default();
             if resp.clicked() {
                 self.selected_pin = Some(p.position.clone());
+                self.pin_popup = p.gpio.clone().map(|g| {
+                    let l = label(self, &g);
+                    PinPopup::new(g, PinPopupKind::Functions, l)
+                });
             }
             if resp.secondary_clicked() {
                 self.selected_pin = Some(p.position.clone());
-                ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::unique("pin_ctx"), p.gpio.clone()));
+                self.pin_popup = p.gpio.clone().map(|g| {
+                    let l = label(self, &g);
+                    PinPopup::new(g, PinPopupKind::Label, l)
+                });
             }
-            let mut tip = format!("Pin {}  ·  {}", p.position, p.signals.join(" / "));
-            if let Some(cfg) = p.gpio.as_ref().and_then(|g| self.project.pins.get(g)) {
-                tip.push_str(&format!("\n{}", cfg.mode.label()));
-                if !cfg.label.is_empty() {
-                    tip.push_str(&format!("  “{}”", cfg.label));
+            if self.pin_popup.is_none() {
+                let mut tip = format!("Pin {}  ·  {}", p.position, p.signals.join(" / "));
+                if let Some(cfg) = p.gpio.as_ref().and_then(|g| self.project.pins.get(g)) {
+                    tip.push_str(&format!("\n{}", cfg.mode.label()));
+                    if !cfg.label.is_empty() {
+                        tip.push_str(&format!("  “{}”", cfg.label));
+                    }
                 }
-            }
-            if !resp.context_menu_opened() {
                 resp.clone().on_hover_text_at_pointer(tip);
             }
-        } else if resp.clicked() {
+        } else if resp.clicked() || resp.secondary_clicked() {
             self.selected_pin = None;
+            self.pin_popup = None;
         }
-
-        let ctx_pin: Option<String> = ui.ctx().memory(|m| m.data.get_temp::<Option<String>>(egui::Id::unique("pin_ctx"))).flatten();
-        if let Some(gpio) = ctx_pin {
-            resp.context_menu(|ui| {
-                ui.set_min_width(200.0);
-                ui.label(RichText::new(&gpio).strong().color(theme::ACCENT));
-                ui.separator();
-                if let Some(mode) = self.mode_menu(ui, &gpio) {
-                    self.assign_pin(&gpio, mode);
-                    ui.close();
-                }
-            });
-        }
+        self.show_pin_popup(ui);
 
         // Help overlay
         painter.text(
             rect.left_bottom() + vec2(10.0, -10.0),
             Align2::LEFT_BOTTOM,
-            "Click: select  ·  Right-click: assign  ·  Wheel: zoom  ·  Drag: pan  ·  Double-click: reset view",
+            "Left-click: pin functions  ·  Right-click: user label  ·  Wheel: zoom  ·  Drag: pan  ·  Double-click: reset view",
             FontId::proportional(11.0),
             theme::TEXT_DIM,
         );
     }
 
-    /// Menu with all modes for a GPIO; returns Some(choice) when clicked (None = reset).
-    fn mode_menu(&self, ui: &mut egui::Ui, gpio: &str) -> Option<Option<PinMode>> {
+    /// Does a pin match one search token? Looks at position, package signals,
+    /// routable peripheral functions, the assigned mode and the user label.
+    fn pin_matches(&self, p: &PinGeom, token: &str) -> bool {
+        if p.position.to_ascii_uppercase().contains(token) || p.signals.iter().any(|s| s.to_ascii_uppercase().contains(token)) {
+            return true;
+        }
+        let Some(g) = &p.gpio else { return false };
+        if let Some(cfg) = self.project.pins.get(g) {
+            if cfg.label.to_ascii_uppercase().contains(token) || cfg.mode.label().contains(token) {
+                return true;
+            }
+        }
+        self.pin_functions.get(g).is_some_and(|fs| fs.iter().any(|f| f.label().contains(token)))
+    }
+
+    /// The open pin popup: function list (left-click) or label editor (right-click).
+    fn show_pin_popup(&mut self, ui: &mut egui::Ui) {
+        let Some(mut pp) = self.pin_popup.take() else { return };
+        let id = egui::Id::unique(("pin_popup", &pp.gpio, pp.kind));
+        let opening = std::mem::take(&mut pp.opening);
+        let gpio = pp.gpio.clone();
+        let mut keep = true;
+        let mut choice: Option<Option<PinMode>> = None;
+        let mut new_label: Option<String> = None;
+
+        let shown = egui::Popup::new(id, ui.ctx().clone(), egui::PopupAnchor::PointerFixed, ui.layer_id())
+            .kind(egui::PopupKind::Menu)
+            .layout(egui::Layout::top_down_justified(egui::Align::Min))
+            .style(egui::containers::menu::menu_style)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .open_memory(opening.then_some(egui::SetOpenCommand::Bool(true)))
+            .show(|ui| match pp.kind {
+                PinPopupKind::Functions => {
+                    ui.set_min_width(230.0);
+                    ui.label(RichText::new(&gpio).strong().color(theme::ACCENT));
+                    ui.separator();
+                    choice = self.pin_function_list(ui, &gpio);
+                }
+                PinPopupKind::Label => {
+                    ui.set_min_width(260.0);
+                    ui.label(RichText::new(format!("{gpio}  ·  Enter User Label")).strong().color(theme::ACCENT));
+                    ui.separator();
+                    if self.project.pins.contains_key(&gpio) {
+                        let r = ui.add(egui::TextEdit::singleline(&mut pp.label).hint_text("e.g. LED_GREEN").desired_width(240.0));
+                        if opening {
+                            r.request_focus();
+                        }
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.horizontal(|ui| {
+                            if ui.button("OK").clicked() || enter {
+                                new_label = Some(pp.label.trim().to_string());
+                            }
+                            if ui.button("Clear label").clicked() {
+                                new_label = Some(String::new());
+                            }
+                        });
+                        ui.label(RichText::new("Names the pin in the generated board.rs.").size(11.0).color(theme::TEXT_DIM));
+                    } else {
+                        ui.label(
+                            RichText::new("Assign a function first (left-click the pin); the label names it in generated code.")
+                                .size(12.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                    }
+                    ui.separator();
+                    if ui.button("Reset_State").clicked() {
+                        choice = Some(None);
+                    }
+                }
+            });
+
+        if shown.is_none() {
+            keep = false;
+        }
+        if let Some(mode) = choice {
+            self.assign_pin(&gpio, mode);
+            keep = false;
+        }
+        if let Some(l) = new_label {
+            if let Some(cfg) = self.project.pins.get_mut(&gpio) {
+                if cfg.label != l {
+                    cfg.label = l;
+                    self.mark_dirty();
+                }
+            }
+            keep = false;
+        }
+        if keep {
+            self.pin_popup = Some(pp);
+        } else {
+            egui::Popup::close_id(ui.ctx(), id);
+        }
+    }
+
+    /// All functions of a GPIO, CubeMX style; returns Some(choice) when one is clicked
+    /// (`Some(None)` = Reset_State). The current function is highlighted.
+    fn pin_function_list(&self, ui: &mut egui::Ui, gpio: &str) -> Option<Option<PinMode>> {
+        let current = self.project.pins.get(gpio).map(|c| &c.mode);
         let mut out = None;
-        if ui.button("Reset (unused)").clicked() {
+        if ui.selectable_label(current.is_none(), "Reset_State").clicked() {
             out = Some(None);
         }
+        let line: String = gpio.chars().skip(2).collect();
         for (mode, text) in [
-            (PinMode::GpioOutput, "GPIO_Output"),
-            (PinMode::GpioInput, "GPIO_Input"),
-            (PinMode::ExtiInput, "GPIO_EXTI (interrupt)"),
-            (PinMode::Analog, "GPIO_Analog"),
+            (PinMode::GpioInput, "GPIO_Input".to_string()),
+            (PinMode::GpioOutput, "GPIO_Output".to_string()),
+            (PinMode::Analog, "GPIO_Analog".to_string()),
+            (PinMode::ExtiInput, format!("GPIO_EXTI{line}")),
         ] {
-            if ui.button(text).clicked() {
+            if ui.selectable_label(current == Some(&mode), text).clicked() {
                 out = Some(Some(mode));
             }
         }
@@ -390,9 +562,15 @@ impl Editor {
             ui.separator();
             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                 for f in funcs {
-                    let af = f.af.map(|a| format!("  AF{a}")).unwrap_or_default();
-                    if ui.button(format!("{}{af}", f.label())).clicked() {
-                        out = Some(Some(PinMode::Peripheral { peripheral: f.peripheral, signal: f.signal, af: f.af }));
+                    let mode = PinMode::Peripheral { peripheral: f.peripheral.clone(), signal: f.signal.clone(), af: f.af };
+                    let selected = matches!(current, Some(PinMode::Peripheral { peripheral, signal, .. }) if *peripheral == f.peripheral && *signal == f.signal);
+                    let mut text = egui::text::LayoutJob::default();
+                    text.append(&f.label(), 0.0, egui::TextFormat { color: theme::TEXT, ..Default::default() });
+                    if let Some(a) = f.af {
+                        text.append(&format!("   AF{a}"), 0.0, egui::TextFormat { color: theme::TEXT_DIM, font_id: FontId::monospace(11.0), ..Default::default() });
+                    }
+                    if ui.selectable_label(selected, text).clicked() {
+                        out = Some(Some(mode));
                     }
                 }
             });
@@ -455,7 +633,7 @@ impl Editor {
 
     fn gpio_settings(&mut self, ui: &mut egui::Ui, gpio: &str) {
         let current = self.project.pins.get(gpio).cloned();
-        let label = current.as_ref().map(|c| c.mode.label()).unwrap_or_else(|| "Reset (unused)".into());
+        let label = current.as_ref().map(|c| c.mode.label()).unwrap_or_else(|| "Reset_State".into());
         ui.horizontal(|ui| {
             ui.label(RichText::new(gpio).strong().size(16.0).color(theme::ACCENT));
         });
@@ -468,7 +646,7 @@ impl Editor {
                 .width(200.0)
                 .height(420.0)
                 .show_ui(ui, |ui| {
-                    choice = self.mode_menu(ui, gpio);
+                    choice = self.pin_function_list(ui, gpio);
                 });
         });
         if let Some(mode) = choice {

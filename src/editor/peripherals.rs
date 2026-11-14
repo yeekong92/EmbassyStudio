@@ -10,15 +10,86 @@ use crate::db::{Chip, KernelClock, Peripheral};
 use crate::project::PinMode;
 use crate::theme;
 
-/// Register kinds that are part of the core system rather than user-facing peripherals.
-const SYSTEM_KINDS: &[&str] = &["rcc", "gpio", "flash", "pwr", "dbgmcu", "syscfg", "exti", "afio", "uid", "bdma", "dma", "dmamux", "gpdma", "lpdma", "mdma", "vrefintcal", "tamp", "fmac", "icache", "dcache", "ramcfg", "sbs", "pka", "ipcc", "hsem", "adccommon", "flash_eeprom", "nvic", "scb"];
+/// Register kinds that are internal plumbing (configured elsewhere or not at all), never listed.
+const HIDDEN_KINDS: &[&str] = &["rcc", "gpio", "flash", "pwr", "dbgmcu", "syscfg", "exti", "afio", "uid", "vrefintcal", "tscal", "adccommon", "flash_eeprom", "nvic", "scb", "ramcfg", "sbs", "octospim"];
 
-fn kind(p: &Peripheral) -> &str {
-    p.registers.as_ref().map(|r| r.kind.as_str()).unwrap_or("")
+/// Peripheral categories, in display order (same grouping as STM32CubeMX).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(super) enum Category {
+    SystemCore,
+    Analog,
+    Timers,
+    Connectivity,
+    Multimedia,
+    Security,
+    Computing,
+    Other,
+}
+
+impl Category {
+    const ALL: [Category; 8] = [
+        Self::SystemCore,
+        Self::Analog,
+        Self::Timers,
+        Self::Connectivity,
+        Self::Multimedia,
+        Self::Security,
+        Self::Computing,
+        Self::Other,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::SystemCore => "System Core",
+            Self::Analog => "Analog",
+            Self::Timers => "Timers",
+            Self::Connectivity => "Connectivity",
+            Self::Multimedia => "Multimedia",
+            Self::Security => "Security",
+            Self::Computing => "Computing",
+            Self::Other => "Other",
+        }
+    }
+
+    /// Category for a register kind (from stm32-data) or, for blocks without
+    /// register data, the lowercase name without its instance number.
+    fn of(kind: &str) -> Self {
+        match kind {
+            "dma" | "bdma" | "gpdma" | "lpdma" | "hpdma" | "mdma" | "dmamux" | "iwdg" | "wwdg" | "crs" | "icache" | "dcache"
+            | "hsem" | "ipcc" => Self::SystemCore,
+            "adc" | "dac" | "comp" | "opamp" | "vrefbuf" | "sdadc" | "dfsdm" | "mdf" | "adf" | "dts" => Self::Analog,
+            "timer" | "tim" | "lptim" | "rtc" | "hrtim" => Self::Timers,
+            "usart" | "lpuart" | "uart" | "spi" | "i2s" | "i2c" | "i3c" | "can" | "fdcan" | "usb" | "otg" | "usbram" | "eth"
+            | "sdmmc" | "octospi" | "quadspi" | "xspi" | "hspi" | "fmc" | "fsmc" | "swpmi" | "ucpd" | "mdios" | "cec" => {
+                Self::Connectivity
+            }
+            "sai" | "dcmi" | "dcmipp" | "dma2d" | "ltdc" | "dsihost" | "jpeg" | "spdifrx" | "tsc" | "gfxmmu" | "lcd" | "gpu2d"
+            | "pssi" => Self::Multimedia,
+            "rng" | "aes" | "cryp" | "hash" | "pka" | "saes" | "tamp" | "gtzc" | "otfdec" | "mpcbb" => Self::Security,
+            "crc" | "cordic" | "fmac" => Self::Computing,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Register kind, or for blocks without register data (e.g. FMC) the name minus its digits.
+fn kind(p: &Peripheral) -> String {
+    match &p.registers {
+        Some(r) => r.kind.clone(),
+        None => p.name.trim_end_matches(|c: char| c.is_ascii_digit()).to_ascii_lowercase(),
+    }
 }
 
 fn is_user_peripheral(p: &Peripheral) -> bool {
-    p.registers.is_some() && !SYSTEM_KINDS.contains(&kind(p))
+    (p.registers.is_some() || !p.pins.is_empty()) && !HIDDEN_KINDS.contains(&kind(p).as_str())
+}
+
+/// Sort key so TIM2 comes before TIM10.
+fn natural_key(name: &str) -> (String, u32, String) {
+    let prefix: String = name.chars().take_while(|c| !c.is_ascii_digit()).collect();
+    let rest = &name[prefix.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    (prefix, digits.parse().unwrap_or(0), rest[digits.len()..].to_string())
 }
 
 impl Editor {
@@ -42,57 +113,109 @@ impl Editor {
         }
     }
 
+    /// Left column: peripherals grouped by category. Selecting one opens its
+    /// configuration in the column to the right (see `peripheral_config_panel`).
     pub(super) fn peripheral_panel(&mut self, ui: &mut egui::Ui, chip: &Chip) {
         ui.add_space(6.0);
         theme::heading(ui, "Peripherals");
         ui.add(
             egui::TextEdit::singleline(&mut self.periph_search)
-                .hint_text("🔍 Filter (e.g. usart, spi1)")
+                .hint_text("🔍 Filter (e.g. usart, spi1, timers)")
                 .desired_width(f32::INFINITY),
         );
         ui.add_space(4.0);
 
-        let mut groups: BTreeMap<String, Vec<&Peripheral>> = BTreeMap::new();
-        let filter = self.periph_search.to_ascii_uppercase();
+        let filter = self.periph_search.trim().to_ascii_uppercase();
+        let mut groups: BTreeMap<Category, Vec<&Peripheral>> = BTreeMap::new();
         for p in chip.peripherals().iter().filter(|p| is_user_peripheral(p)) {
-            if !filter.is_empty() && !p.name.contains(&filter) && !kind(p).to_ascii_uppercase().contains(&filter) {
+            let k = kind(p);
+            let cat = Category::of(&k);
+            if !filter.is_empty()
+                && !p.name.contains(&filter)
+                && !k.to_ascii_uppercase().contains(&filter)
+                && !cat.title().to_ascii_uppercase().contains(&filter)
+            {
                 continue;
             }
-            groups.entry(kind(p).to_ascii_uppercase()).or_default().push(p);
+            groups.entry(cat).or_default().push(p);
         }
+        for list in groups.values_mut() {
+            list.sort_by_key(|p| natural_key(&p.name));
+        }
+        let show_middleware = filter.is_empty() || "MIDDLEWARE DEFMT LOGGING EMBASSY".contains(&filter);
 
-        let detail_height = if self.selected_periph.is_some() { ui.available_height() * 0.5 } else { 0.0 };
         egui::ScrollArea::vertical()
             .id_salt("periph_list")
-            .max_height(ui.available_height() - detail_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (group, list) in &groups {
+                for cat in Category::ALL {
+                    let Some(list) = groups.get(&cat) else { continue };
                     let enabled = list.iter().filter(|p| self.project.is_peripheral_enabled(&p.name)).count();
                     let header = if enabled > 0 {
-                        RichText::new(format!("{group}   {enabled}/{}", list.len())).strong().color(theme::ACCENT)
+                        RichText::new(format!("{}   {enabled}/{}", cat.title(), list.len())).strong().color(theme::ACCENT)
                     } else {
-                        RichText::new(format!("{group}   {}", list.len())).strong()
+                        RichText::new(format!("{}   {}", cat.title(), list.len())).strong()
                     };
+                    let selected_here = self
+                        .selected_periph
+                        .as_ref()
+                        .is_some_and(|s| list.iter().any(|p| &p.name == s));
                     egui::CollapsingHeader::new(header)
-                        .id_salt(group)
-                        .default_open(!filter.is_empty() || enabled > 0)
+                        .id_salt(("category", cat))
+                        .default_open(!filter.is_empty() || enabled > 0 || selected_here)
+                        .open((!filter.is_empty()).then_some(true))
                         .show(ui, |ui| {
                             for p in list {
                                 self.peripheral_row(ui, p);
                             }
                         });
                 }
+                if show_middleware {
+                    egui::CollapsingHeader::new(RichText::new("Middleware").strong())
+                        .id_salt(("category", "middleware"))
+                        .default_open(!filter.is_empty())
+                        .show(ui, |ui| self.middleware_rows(ui));
+                }
             });
+    }
 
-        if let Some(name) = self.selected_periph.clone() {
-            if let Some(p) = chip.peripheral(&name) {
-                ui.separator();
-                egui::ScrollArea::vertical().id_salt("periph_detail").auto_shrink([false, false]).show(ui, |ui| {
-                    self.peripheral_detail(ui, p);
-                });
+    /// Software components the generated project is built on.
+    fn middleware_rows(&mut self, ui: &mut egui::Ui) {
+        let dim = |t: &str| RichText::new(t).size(11.0).color(theme::TEXT_DIM);
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut self.project.codegen.defmt, "").changed() {
+                self.mark_dirty();
             }
-        }
+            ui.label(RichText::new("DEFMT").monospace());
+            ui.label(dim("RTT logging + panic-probe"));
+        });
+        ui.horizontal(|ui| {
+            ui.add_enabled(false, egui::Checkbox::without_text(&mut true));
+            ui.label(RichText::new("EMBASSY").monospace());
+            ui.label(dim("async executor + time driver (always on)"));
+        });
+    }
+
+    /// Right column: "Mode and Configuration" of the selected peripheral.
+    pub(super) fn peripheral_config_panel(&mut self, ui: &mut egui::Ui, p: &Peripheral) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            theme::heading(ui, &format!("{} Configuration", p.name));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✕").on_hover_text("Close").clicked() {
+                    self.selected_periph = None;
+                }
+            });
+        });
+        ui.label(
+            RichText::new(format!("{}  ·  {}", Category::of(&kind(p)).title(), p.registers.as_ref().map(|r| format!("{} {}", r.kind, r.version)).unwrap_or_default()))
+                .size(11.0)
+                .color(theme::TEXT_DIM),
+        );
+        ui.separator();
+        egui::ScrollArea::vertical().id_salt(("periph_detail", &p.name)).auto_shrink([false, false]).show(ui, |ui| {
+            self.peripheral_detail(ui, p);
+        });
     }
 
     fn peripheral_row(&mut self, ui: &mut egui::Ui, p: &Peripheral) {
@@ -117,23 +240,15 @@ impl Editor {
     }
 
     fn peripheral_detail(&mut self, ui: &mut egui::Ui, p: &Peripheral) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&p.name).strong().size(16.0).color(theme::ACCENT));
-            if let Some(r) = &p.registers {
-                ui.label(RichText::new(format!("{} {}", r.kind, r.version)).size(11.0).color(theme::TEXT_DIM));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("✕").clicked() {
-                    self.selected_periph = None;
-                }
-            });
-        });
+        theme::section(ui, "Mode");
         let mut enabled = self.project.is_peripheral_enabled(&p.name);
         if ui.checkbox(&mut enabled, "Enabled").changed() {
             self.project.set_peripheral_enabled(&p.name, enabled);
             self.mark_dirty();
         }
 
+        ui.add_space(6.0);
+        theme::section(ui, "Parameter Settings");
         egui::Grid::new(("periph_info", &p.name)).num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
             ui.label(RichText::new("Address").color(theme::TEXT_DIM));
             ui.label(RichText::new(format!("0x{:08X}", p.address)).monospace());
@@ -185,7 +300,7 @@ impl Editor {
         }
 
         // Settings for drivers the code generator knows.
-        let settings: &[(&str, &str, &str)] = match kind(p) {
+        let settings: &[(&str, &str, &str)] = match kind(p).as_str() {
             "usart" | "lpuart" => &[("baudrate", "Baud rate", "115200")],
             "spi" => &[("frequency", "SCK frequency (Hz)", "1000000")],
             "i2c" => &[("frequency", "Bus frequency (Hz)", "100000")],
