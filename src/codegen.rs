@@ -609,6 +609,18 @@ fn rcc_config(project: &Project, chip: &Chip, tree: Option<&ClockTree>) -> RccCo
     for (bus, _, f) in &results.apb {
         let _ = writeln!(out, "    //   {bus}={}", format_hz(*f));
     }
+    for (pll, r) in tree.aux_plls.iter().zip(&results.aux).filter(|(_, r)| r.enabled) {
+        let hz = |f: Option<f64>| f.map(format_hz).unwrap_or_else(|| "-".into());
+        let _ = writeln!(
+            out,
+            "    //   {}: VCO {} -> P={} Q={} R={}",
+            pll.name,
+            format_hz(r.vco),
+            hz(r.p),
+            hz(r.q),
+            hz(r.r)
+        );
+    }
 
     let flavor = rcc_flavor(tree);
     let mut code = String::new();

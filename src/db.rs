@@ -443,6 +443,21 @@ pub struct BlockItem {
     pub name: String,
     #[serde(default)]
     pub fieldset: Option<String>,
+    /// Register arrays (e.g. H7 `PLLDIVR` x3): `{"len": 3, "stride": 8}`.
+    #[serde(default)]
+    pub array: Option<Value>,
+}
+
+impl BlockItem {
+    /// Number of registers in an array item (1 for plain registers).
+    pub fn array_len(&self) -> usize {
+        self.array
+            .as_ref()
+            .and_then(|a| a.get("len"))
+            .and_then(Value::as_u64)
+            .map(|n| n.max(1) as usize)
+            .unwrap_or(1)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

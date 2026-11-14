@@ -72,6 +72,70 @@ pub struct ClockTree {
     pub muxes: BTreeMap<String, Selector>,
     /// Oscillators referenced by the clock selectors (HSE, HSI, MSI, LSE, ...).
     pub oscillators: Vec<String>,
+    /// Name of the main PLL as used in mux variants (`PLL1` or `PLL`).
+    pub main_pll: String,
+    /// Additional PLLs (PLLSAI1/2, PLLI2S, PLL2/3, ...).
+    pub aux_plls: Vec<PllUnit>,
+    /// Oscillators whose frequency is a selectable range (MSI: `MSIRANGE`).
+    pub osc_range: BTreeMap<String, Selector>,
+    /// Oscillators with an output divider (H7 HSI: `HSIDIV`).
+    pub osc_div: BTreeMap<String, Selector>,
+    /// LSE drive strength.
+    pub lse_drive: Option<Selector>,
+    /// Microcontroller clock outputs: (source mux, prescaler).
+    pub mcos: Vec<(Selector, Option<Selector>)>,
+    /// Other RCC choices shown in the tree (wake-up clock, timer prescaler, ...).
+    pub misc: Vec<Selector>,
+}
+
+/// One PLL discovered from the RCC registers.
+#[derive(Clone, Debug)]
+pub struct PllUnit {
+    /// Name used in mux variants, e.g. `PLLSAI1`, `PLLI2S`, `PLL2`.
+    pub name: String,
+    /// Own input mux; None = shares the main PLL source.
+    pub src: Option<Selector>,
+    /// Own input divider; None = shares the main PLL /M.
+    pub m: Option<Selector>,
+    pub n: Selector,
+    pub p: Option<Selector>,
+    pub q: Option<Selector>,
+    pub r: Option<Selector>,
+}
+
+impl PllUnit {
+    pub fn output(&self, letter: char) -> Option<&Selector> {
+        match letter {
+            'P' => self.p.as_ref(),
+            'Q' => self.q.as_ref(),
+            'R' => self.r.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// `PLLSAI1CFGR` -> `PLLSAI1`, `PLL2DIVR` -> `PLL2`, `PLLCFGR` -> `PLL`.
+fn pll_group(register: &str) -> Option<String> {
+    if !register.starts_with("PLL") {
+        return None;
+    }
+    ["CKSELR", "CFGR", "DIVR", "FRACR"]
+        .iter()
+        .find_map(|s| register.strip_suffix(s))
+        .map(str::to_string)
+}
+
+/// Role of a field inside a PLL register: M, N, P, Q, R or S(ource).
+fn pll_role(field: &str) -> Option<char> {
+    Some(match field {
+        "PLLM" | "DIVM" => 'M',
+        "PLLN" | "DIVN" | "PLLMUL" => 'N',
+        "PLLP" | "DIVP" => 'P',
+        "PLLQ" | "DIVQ" => 'Q',
+        "PLLR" | "DIVR" => 'R',
+        "PLLSRC" => 'S',
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -124,21 +188,110 @@ impl ClockTree {
         }
 
         let mut osc = std::collections::BTreeSet::new();
-        let mut add = |s: &Option<Selector>| {
+        let mut add = |s: Option<&Selector>| {
             for v in s.iter().flat_map(|s| s.variants.iter()) {
                 if let Some(base) = oscillator_base(&v.name) {
                     osc.insert(base);
                 }
             }
         };
-        add(&tree.sys);
-        add(&tree.pll_src);
-        add(&find(&["RTCSEL"]));
+        add(tree.sys.as_ref());
+        add(tree.pll_src.as_ref());
+        add(find(&["RTCSEL"]).as_ref());
+        // Kernel muxes and clock outputs can reach oscillators nothing else uses (HSI48, LSI...).
+        for s in tree.muxes.values() {
+            add(Some(s));
+        }
         // Put HSE first, then the rest in a stable order.
         let mut list: Vec<String> = osc.into_iter().collect();
         list.sort_by_key(|o| (!o.starts_with("HSE"), !o.starts_with("HS"), o.clone()));
         tree.oscillators = list;
+
+        tree.discover_plls(rcc);
+        for o in &tree.oscillators {
+            if let Some(s) = find(&[&format!("{o}RANGE")]) {
+                tree.osc_range.insert(o.clone(), s);
+            }
+            if let Some(s) = find(&[&format!("{o}DIV")]) {
+                tree.osc_div.insert(o.clone(), s);
+            }
+        }
+        tree.lse_drive = find(&["LSEDRV"]);
+        for (sel_name, pre_name) in [("MCOSEL", "MCOPRE"), ("MCO1SEL", "MCO1PRE"), ("MCO2SEL", "MCO2PRE")] {
+            if let Some(sel) = find(&[sel_name]) {
+                tree.mcos.push((sel, find(&[pre_name])));
+            }
+        }
+        for name in ["STOPWUCK", "STOPKERWUCK", "TIMPRE", "LSIPREDIV"] {
+            if let Some(s) = find(&[name]) {
+                tree.misc.push(s);
+            }
+        }
         tree
+    }
+
+    /// Group PLL registers by PLL and split them into the main PLL and the others.
+    fn discover_plls(&mut self, rcc: &RegisterFile) {
+        // group -> role -> selector, plus whether the group came from a register array.
+        let mut groups: BTreeMap<String, (BTreeMap<char, Selector>, bool)> = BTreeMap::new();
+        for item in &rcc.registers {
+            let Some(group) = pll_group(&item.name) else { continue };
+            let Some(fs) = item.fieldset.as_deref().and_then(|f| rcc.fieldsets.get(f)) else { continue };
+            let len = item.array_len();
+            for f in &fs.fields {
+                let Some(role) = pll_role(&f.name) else { continue };
+                let Some(sel) = Selector::from_field(rcc, &item.name, f) else { continue };
+                for idx in 0..len {
+                    let mut s = sel.clone();
+                    let name = if len > 1 {
+                        s.register = format!("{}{}", item.name, idx + 1);
+                        format!("{group}{}", idx + 1)
+                    } else {
+                        group.clone()
+                    };
+                    let entry = groups.entry(name).or_insert_with(|| (BTreeMap::new(), len > 1));
+                    entry.0.entry(role).or_insert(s);
+                }
+            }
+        }
+        let main_reg = self.pll_n.as_ref().map(|s| s.register.clone()).unwrap_or_default();
+        let shared_m = groups.get("PLL").and_then(|(g, _)| g.get(&'M').cloned());
+        for (name, (mut roles, from_array)) in groups {
+            let Some(n) = roles.remove(&'N') else { continue };
+            if n.register == main_reg || n.register == format!("{main_reg}1") {
+                // Variants call the main PLL `PLL1` even when its registers say `PLL`.
+                self.main_pll = if name.ends_with(|c: char| c.is_ascii_digit()) { name } else { format!("{name}1") };
+                continue;
+            }
+            // H7-style arrays share one DIVM field per PLL, numbered by PLL.
+            let m = roles.remove(&'M').or_else(|| {
+                let digit = name.chars().last().filter(|c| c.is_ascii_digit())?;
+                let mut m = shared_m.clone().filter(|_| from_array)?;
+                m.field = format!("{}{digit}", m.field);
+                Some(m)
+            });
+            self.aux_plls.push(PllUnit {
+                name,
+                src: roles.remove(&'S'),
+                m,
+                n,
+                p: roles.remove(&'P'),
+                q: roles.remove(&'Q'),
+                r: roles.remove(&'R'),
+            });
+        }
+        if self.main_pll.is_empty() {
+            self.main_pll = "PLL1".into();
+        }
+    }
+
+    /// Kernel-clock muxes that are not part of the core tree (PLL source, MCO, RTC...).
+    pub fn is_system_mux(key: &str) -> bool {
+        let field = key.rsplit('.').next().unwrap_or(key);
+        field.starts_with("PLL")
+            || field.starts_with("MCO")
+            || field.starts_with("MSI")
+            || matches!(field, "RTCSEL" | "LSCOSEL" | "SW")
     }
 
     pub fn selector(&self, role: Role) -> Option<&Selector> {
@@ -215,6 +368,32 @@ pub struct ClockConfig {
     /// PLL P/Q/R outputs the user switched on (the one feeding SYSCLK is always on).
     #[serde(default)]
     pub pll_outputs: BTreeMap<Role, bool>,
+    /// Other selector values by `REGISTER.FIELD`: extra PLLs, MSI range, MCO prescaler, ...
+    #[serde(default)]
+    pub extra: BTreeMap<String, String>,
+    /// Extra PLLs switched on, by name (`PLLSAI1`).
+    #[serde(default)]
+    pub aux_pll_enabled: BTreeMap<String, bool>,
+}
+
+/// Fields stored in `ClockConfig::muxes` (the rest go to `extra`), mirroring `ClockTree::from_rcc`.
+fn is_mux_field(field: &str) -> bool {
+    field.ends_with("SEL") || field.ends_with("SRC")
+}
+
+/// Frequency named by an oscillator range variant: `Range4M` -> 4 MHz, `Range100K` -> 100 kHz.
+fn range_frequency(variant: &str) -> Option<f64> {
+    let upper = variant.to_ascii_uppercase();
+    let start = upper.find(|c: char| c.is_ascii_digit())?;
+    let rest = &upper[start..];
+    let num_len = rest.find(|c: char| !(c.is_ascii_digit() || c == '_' || c == '.')).unwrap_or(rest.len());
+    let value: f64 = rest[..num_len].trim_end_matches('_').replace('_', ".").parse().ok()?;
+    let unit = match rest[num_len..].chars().next() {
+        Some('M') => 1e6,
+        Some('K') => 1e3,
+        _ => 1.0,
+    };
+    Some(value * unit)
 }
 
 /// Nominal oscillator frequency used to seed a new configuration.
@@ -265,13 +444,41 @@ impl ClockConfig {
                 self.apb.insert(sel.field.clone(), sel.default_variant().to_string());
             }
         }
+        // Range-selected oscillators (MSI): variant 0 is the lowest range, not the
+        // reset one, so start from the range matching the configured frequency (4 MHz).
+        for (osc, sel) in &tree.osc_range {
+            if self.extra.get(&sel.key()).is_some_and(|v| sel.has(v)) {
+                continue;
+            }
+            let want = self.oscillators.get(osc).copied().unwrap_or_else(|| nominal_frequency(osc));
+            if let Some(v) = sel.variants.iter().find(|v| range_frequency(&v.name) == Some(want)) {
+                self.extra.insert(sel.key(), v.name.clone());
+            }
+        }
     }
 
     pub fn role(&self, role: Role) -> Option<&str> {
         self.roles.get(&role).map(String::as_str)
     }
 
-    /// Whether a PLL output divider is active: user-enabled or feeding SYSCLK.
+    /// Current value of any selector (kernel mux or other RCC field), or its reset default.
+    pub fn value<'a>(&'a self, sel: &'a Selector) -> &'a str {
+        let key = sel.key();
+        let stored = if is_mux_field(&sel.field) { self.muxes.get(&key) } else { self.extra.get(&key) };
+        stored.map(String::as_str).filter(|v| sel.has(v)).unwrap_or(sel.default_variant())
+    }
+
+    pub fn set_value(&mut self, sel: &Selector, value: String) {
+        let map = if is_mux_field(&sel.field) { &mut self.muxes } else { &mut self.extra };
+        map.insert(sel.key(), value);
+    }
+
+    pub fn aux_enabled(&self, name: &str) -> bool {
+        self.aux_pll_enabled.get(name).copied().unwrap_or(false)
+    }
+
+    /// Whether a PLL output divider is active: user-enabled, feeding SYSCLK, or
+    /// selected by a kernel clock mux (e.g. `CLK48SEL = PLL1_Q`).
     pub fn pll_output_enabled(&self, role: Role) -> bool {
         let letter = match role {
             Role::PllP => "P",
@@ -281,11 +488,28 @@ impl ClockConfig {
         };
         let sys = self.role(Role::Sys).unwrap_or("");
         let feeds_sys = sys.starts_with("PLL") && sys.rsplit('_').next() == Some(letter);
-        feeds_sys || self.pll_outputs.get(&role).copied().unwrap_or(false)
+        let feeds_mux = self
+            .muxes
+            .values()
+            .any(|v| (v.starts_with("PLL1_") || v.starts_with("PLL_")) && v.rsplit('_').next() == Some(letter));
+        feeds_sys || feeds_mux || self.pll_outputs.get(&role).copied().unwrap_or(false)
     }
 
     pub fn is_enabled(&self, osc: &str) -> bool {
         self.enabled.get(osc).copied().unwrap_or(false)
+    }
+
+    /// Oscillator frequency as configured (range/divider applied), ignoring enable state.
+    pub fn osc_frequency(&self, tree: &ClockTree, name: &str) -> f64 {
+        let mut f = tree
+            .osc_range
+            .get(name)
+            .and_then(|sel| range_frequency(self.value(sel)))
+            .unwrap_or_else(|| self.oscillators.get(name).copied().unwrap_or(0.0));
+        if let Some(d) = tree.osc_div.get(name).and_then(|sel| factor(self.value(sel))) {
+            f *= d;
+        }
+        f
     }
 
     pub fn compute(&self, tree: &ClockTree) -> ClockResults {
@@ -294,7 +518,7 @@ impl ClockConfig {
             if !self.is_enabled(name) {
                 return 0.0;
             }
-            self.oscillators.get(name).copied().unwrap_or(0.0)
+            self.osc_frequency(tree, name)
         };
         // Resolve a mux variant (HSE, HSI_DIV2, ...) to an oscillator frequency.
         let source = |variant: &str| -> f64 {
@@ -355,7 +579,87 @@ impl ClockConfig {
         for o in &tree.oscillators {
             r.buses.insert(o.clone(), osc(o));
         }
+        // Timer clocks run at 2x PCLK when the APB prescaler divides.
+        for (bus, field, f) in r.apb.clone() {
+            let div = self.apb.get(&field).and_then(|v| factor(v)).unwrap_or(1.0);
+            let tim = if div < 1.0 { f * 2.0 } else { f };
+            r.apb_timers.push((bus.clone(), tim));
+            r.buses.insert(format!("{bus}_TIM"), tim);
+        }
+
+        // Main PLL outputs under the names mux variants use.
+        let main = tree.main_pll.trim_end_matches('1').to_string();
+        for (letter, f) in [('P', r.pll_p), ('Q', r.pll_q), ('R', r.pll_r)] {
+            if let Some(f) = f.filter(|_| self.pll_enabled) {
+                for name in [&tree.main_pll, &main, &format!("{main}1")] {
+                    r.buses.insert(format!("{name}_{letter}"), f);
+                }
+            }
+        }
+        // "PLL" alone (MCO, F1 USB) means the output that can drive SYSCLK.
+        if self.pll_enabled {
+            if let Some(f) = r.pll_r.or(r.pll_p) {
+                r.buses.insert("PLL".into(), f);
+                r.buses.insert("PLLCLK".into(), f);
+            }
+        }
+
+        // Extra PLLs.
+        let main_src = self.role(Role::PllSrc).map(source).unwrap_or(0.0);
+        let main_m = self.role(Role::PllM).and_then(factor).unwrap_or(1.0);
+        for pll in &tree.aux_plls {
+            let enabled = self.aux_enabled(&pll.name);
+            let src = pll.src.as_ref().map(|s| source(self.value(s))).unwrap_or(main_src);
+            let m = pll.m.as_ref().and_then(|s| factor(self.value(s))).unwrap_or(main_m);
+            let n = factor(self.value(&pll.n)).unwrap_or(1.0);
+            let pll_in = src * m;
+            let vco = pll_in * n;
+            let out = |sel: &Option<Selector>| sel.as_ref().and_then(|s| factor(self.value(s))).map(|d| vco * d);
+            let res = PllResult { enabled, pll_in, vco, p: out(&pll.p), q: out(&pll.q), r: out(&pll.r) };
+            if enabled {
+                let alias = if pll.name.ends_with(|c: char| c.is_ascii_digit()) { None } else { Some(format!("{}1", pll.name)) };
+                for (letter, f) in [('P', res.p), ('Q', res.q), ('R', res.r)] {
+                    let Some(f) = f else { continue };
+                    r.buses.insert(format!("{}_{letter}", pll.name), f);
+                    if let Some(a) = &alias {
+                        r.buses.insert(format!("{a}_{letter}"), f);
+                    }
+                }
+            }
+            r.aux.push(res);
+        }
+
+        // Kernel clock muxes and clock outputs.
+        for (key, sel) in &tree.muxes {
+            r.kernel.insert(key.clone(), r.resolve(self.value(sel)).unwrap_or(0.0));
+        }
+        for (sel, pre) in &tree.mcos {
+            let f = r.resolve(self.value(sel)).unwrap_or(0.0);
+            let d = pre.as_ref().and_then(|p| factor(self.value(p))).unwrap_or(1.0);
+            r.mco.push(f * d);
+        }
         r
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PllResult {
+    pub enabled: bool,
+    pub pll_in: f64,
+    pub vco: f64,
+    pub p: Option<f64>,
+    pub q: Option<f64>,
+    pub r: Option<f64>,
+}
+
+impl PllResult {
+    pub fn output(&self, letter: char) -> Option<f64> {
+        match letter {
+            'P' => self.p,
+            'Q' => self.q,
+            'R' => self.r,
+            _ => None,
+        }
     }
 }
 
@@ -383,12 +687,51 @@ pub struct ClockResults {
     pub hclk: f64,
     /// (bus name, prescaler field, frequency)
     pub apb: Vec<(String, String, f64)>,
+    /// (bus name, timer clock)
+    pub apb_timers: Vec<(String, f64)>,
     pub buses: BTreeMap<String, f64>,
+    /// Extra PLLs, in `ClockTree::aux_plls` order.
+    pub aux: Vec<PllResult>,
+    /// Output of every mux in `ClockTree::muxes`, by `REGISTER.FIELD`.
+    pub kernel: BTreeMap<String, f64>,
+    /// Clock outputs, in `ClockTree::mcos` order.
+    pub mco: Vec<f64>,
 }
 
 impl ClockResults {
     pub fn bus(&self, name: &str) -> Option<f64> {
         self.buses.get(name).copied()
+    }
+
+    /// Frequency of a clock named by a mux variant: `PCLK1`, `SYS`, `HSI_DIV2`,
+    /// `PLLSAI1_Q`, `DISABLE`... None when the name is not a clock we model
+    /// (external pins such as `SAI1_EXTCLK`).
+    pub fn resolve(&self, name: &str) -> Option<f64> {
+        if name.starts_with("DISABLE") || matches!(name, "NONE" | "OFF") {
+            return Some(0.0);
+        }
+        if let Some(f) = self.bus(name) {
+            return Some(f);
+        }
+        match name {
+            "SYS" | "SYSCLK" => return Some(self.sysclk),
+            "HCLK" | "AHB" => return Some(self.hclk),
+            _ => {}
+        }
+        if let Some(base) = oscillator_base(name) {
+            let mut f = self.bus(&base)?;
+            if let Some(idx) = name.find("DIV") {
+                if let Some(d) = factor(&name[idx..]) {
+                    f *= d;
+                }
+            }
+            return Some(f);
+        }
+        // An inactive PLL output still names a clock: it is just off.
+        if name.starts_with("PLL") {
+            return Some(0.0);
+        }
+        self.bus(name.trim_end_matches("_P"))
     }
 }
 
@@ -407,4 +750,74 @@ pub fn format_hz(hz: f64) -> String {
 fn trim(v: f64) -> String {
     let s = format!("{v:.3}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Discovery against RCC files in the local stm32-data cache (skipped when absent).
+    fn tree(version: &str) -> Option<ClockTree> {
+        let dir = crate::db::app_dir().join("stm32-data").join("registers").join(format!("rcc_{version}.json"));
+        if !dir.exists() {
+            eprintln!("skipping rcc_{version}: not cached");
+            return None;
+        }
+        let rcc = RegisterFile::load(&crate::db::DataSource::GitHub, "rcc", version, "RCC", false).ok()?;
+        Some(ClockTree::from_rcc(&rcc, version))
+    }
+
+    fn aux_names(t: &ClockTree) -> Vec<String> {
+        t.aux_plls.iter().map(|p| p.name.clone()).collect()
+    }
+
+    #[test]
+    fn discovers_all_plls_and_outputs() {
+        for (version, aux) in [
+            ("l4plus", vec!["PLLSAI1", "PLLSAI2"]),
+            ("l4", vec!["PLLSAI1", "PLLSAI2"]),
+            ("f4", vec!["PLLI2S", "PLLSAI"]),
+            ("g4", vec![]),
+            ("u5", vec!["PLL2", "PLL3"]),
+            ("h7rm0433", vec!["PLL2", "PLL3"]),
+            ("f1", vec![]),
+        ] {
+            let Some(t) = tree(version) else { continue };
+            assert_eq!(aux_names(&t), aux, "aux PLLs of {version}");
+            assert!(t.sys.is_some(), "{version}: SW");
+            println!("{version}: main={} osc={:?} ranges={:?} mcos={} misc={} muxes={}", t.main_pll, t.oscillators, t.osc_range.keys().collect::<Vec<_>>(), t.mcos.len(), t.misc.len(), t.muxes.len());
+        }
+    }
+
+    #[test]
+    fn l4plus_frequencies() {
+        let Some(t) = tree("l4plus") else { return };
+        let mut c = ClockConfig::default();
+        c.normalize(&t);
+        // Reset state: MSI 4 MHz drives SYSCLK.
+        let r = c.compute(&t);
+        assert_eq!(r.sysclk, 4e6);
+        assert_eq!(r.resolve("PCLK1_TIM"), Some(4e6));
+        // MSI 48 MHz into PLLSAI1 (own /M on L4+) feeding CLK48SEL.
+        let msi = &t.osc_range["MSI"];
+        c.set_value(msi, "Range48M".into());
+        let sai1 = t.aux_plls.iter().find(|p| p.name == "PLLSAI1").unwrap();
+        c.roles.insert(Role::PllSrc, "MSI".into());
+        c.roles.insert(Role::PllM, "Div6".into());
+        c.set_value(sai1.m.as_ref().unwrap(), "Div6".into());
+        c.set_value(&sai1.n, "Mul24".into());
+        c.set_value(sai1.q.as_ref().unwrap(), "Div2".into());
+        c.aux_pll_enabled.insert("PLLSAI1".into(), true);
+        let clk48 = &t.muxes["CCIPR.CLK48SEL"];
+        c.set_value(clk48, "PLLSAI1_Q".into());
+        let r = c.compute(&t);
+        assert_eq!(r.sysclk, 48e6);
+        assert_eq!(r.aux[0].vco, 192e6);
+        assert_eq!(r.kernel["CCIPR.CLK48SEL"], 96e6);
+        // APB1 /2 doubles the timer clock.
+        c.apb.insert("PPRE1".into(), "Div2".into());
+        let r = c.compute(&t);
+        assert_eq!(r.resolve("PCLK1"), Some(24e6));
+        assert_eq!(r.resolve("PCLK1_TIM"), Some(48e6));
+    }
 }

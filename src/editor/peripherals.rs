@@ -100,14 +100,14 @@ impl Editor {
             Some(KernelClock::Mux(m)) => {
                 let key = format!("{}.{}", m.register, m.field);
                 let sel = self.tree.as_ref()?.muxes.get(&key)?;
-                let v = self.project.clock.muxes.get(&key).cloned().unwrap_or_else(|| sel.default_variant().to_string());
-                let f = self.clocks.bus(&v).or_else(|| self.clocks.bus(v.trim_end_matches("_P")))?;
+                let v = self.project.clock.value(sel).to_string();
+                let f = self.clocks.resolve(&v)?;
                 Some((v, f))
             }
-            Some(KernelClock::Clock(c)) => Some((c.clone(), self.clocks.bus(c)?)),
+            Some(KernelClock::Clock(c)) => Some((c.clone(), self.clocks.resolve(c)?)),
             None => {
                 let b = rcc.bus_clock.clone()?;
-                let f = self.clocks.bus(&b)?;
+                let f = self.clocks.resolve(&b)?;
                 Some((b, f))
             }
         }

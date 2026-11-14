@@ -189,14 +189,19 @@ impl Editor {
             return;
         };
 
-        egui::Panel::left("peripherals")
-            .resizable(true)
-            .default_size(250.0)
-            .min_size(200.0)
-            .show(ui, |ui| self.peripheral_panel(ui, &chip));
+        // The clock tree uses the full width (as in CubeMX); its peripheral
+        // clock muxes are on the canvas itself.
+        let side_panels = self.tab != Tab::Clock;
+        if side_panels {
+            egui::Panel::left("peripherals")
+                .resizable(true)
+                .default_size(250.0)
+                .min_size(200.0)
+                .show(ui, |ui| self.peripheral_panel(ui, &chip));
+        }
 
         // Configuration of the selected peripheral, to the right of the list.
-        if let Some(p) = self.selected_periph.clone().and_then(|name| chip.peripheral(&name)) {
+        if let Some(p) = self.selected_periph.clone().and_then(|name| chip.peripheral(&name)).filter(|_| side_panels) {
             egui::Panel::left("periph_config")
                 .resizable(true)
                 .default_size(330.0)
