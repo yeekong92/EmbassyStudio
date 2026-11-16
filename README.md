@@ -14,6 +14,9 @@ register layout that the clock tree is built from. Nothing chip-specific is hard
 - **Pinout**: interactive package drawing for QFP/QFN, SO/TSSOP and BGA/WLCSP. Click a pin to
   configure it, right-click to assign GPIO or any alternate function, wheel to zoom, drag to pan.
   Conflicts (e.g. two EXTI pins on one line) are flagged.
+- **Schematic**: import your hardware schematic and configure pins where they are drawn. The MCU's
+  pins are located from the text of the drawing and an interactive node is placed beside each one;
+  see [Schematic overlay](#schematic-overlay).
 - **Clock Configuration**: oscillators → PLL source → /M → ×N → P/Q/R → SYSCLK mux → AHB → APB
   buses, discovered from the RCC enums (`SW`, `PLLSRC`, `PLLM`, `HPRE`, `PPRE*`, …), with live
   frequencies and kernel-clock muxes per peripheral.
@@ -29,6 +32,35 @@ register layout that the clock tree is built from. Nothing chip-specific is hard
 The clock tree is shown for every family. `board.rs` gets real `config.rcc` code for the F2/F4/F7
 and G4 RCC flavours; for other families the chosen tree is written as comments next to
 `Config::default()`, so the project still builds and you can fill in `config.rcc` by hand.
+
+## Schematic overlay
+
+*Schematic → Import schematic…* accepts:
+
+| Format | Background | How pins are found |
+|--------|------------|--------------------|
+| SVG | the file as it is | `<text>` elements, and KiCad's stroked-text groups |
+| PDF | each page converted to SVG | glyph positions, including invisible (searchable) text |
+| KiCad `.kicad_sch` (6+) | redrawn from the file | symbol pin positions |
+| Altium `.SchDoc` | redrawn from the file | pin records |
+
+Text is cross-referenced against the pin names of the project's package (`PA0`, `PC14-OSC32_IN`,
+`VDD`, …). For a multi-page PDF only the pages that show pins of the MCU are imported. Every sheet is
+stored as an SVG in the project's `schematic/` folder and rendered sharply at any zoom.
+
+- **Edit mode** (calibration) opens after an import. Drag a node beside its pin, press `R` to turn its
+  label, `Del` to remove it, and place pins that were not found from the list on the right. *Save*
+  writes the positions to `embassy-studio.json`, relative to the sheet (0–1), so they do not depend
+  on zoom or window size.
+- **View mode** is for configuration: nodes are locked and glued to the drawing while you pan and
+  zoom. Click a node to pick the pin's function, right-click for its label. Colours match the Pinout
+  tab; the assigned function is written next to the node, and pins the selected peripheral can use
+  get a ring.
+
+Importing a sheet again refreshes the drawing and keeps the nodes you calibrated.
+
+The overlay is purely visual. There is no netlist: wires are not traced, other components are not
+interpreted and nothing is checked against the schematic.
 
 ## Data source
 
@@ -57,6 +89,7 @@ The result is `target/release/embassy-studio.exe`.
 embassy-studio                      # Project Hub
 embassy-studio <project-dir>        # open a project directly
 embassy-studio --generate <dir>     # regenerate code without the GUI (scripts / CI)
+embassy-studio --import-schematic <dir> <file>   # import a schematic and auto-locate the pins
 ```
 
 ## Generated project layout
@@ -64,6 +97,7 @@ embassy-studio --generate <dir>     # regenerate code without the GUI (scripts /
 | Path | Regenerated? |
 |------|--------------|
 | `embassy-studio.json` | the project file |
+| `schematic/*.svg` | written by *Import schematic*; node positions are in the project file |
 | `src/board.rs` | always |
 | `Cargo.toml` | yes, except the user section at the bottom |
 | `build.rs`, `.cargo/config.toml`, `rust-toolchain.toml`, `.vscode/*.json` | yes |

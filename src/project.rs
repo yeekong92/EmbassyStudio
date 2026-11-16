@@ -7,6 +7,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::ClockConfig;
+use crate::schematic::SchematicConfig;
 
 pub const PROJECT_FILE: &str = "embassy-studio.json";
 const FORMAT_VERSION: u32 = 1;
@@ -36,6 +37,9 @@ pub struct Project {
     pub peripherals: BTreeMap<String, PeripheralConfig>,
     #[serde(default)]
     pub codegen: CodegenOptions,
+    /// Imported schematic sheets and the pin nodes placed on them.
+    #[serde(default, skip_serializing_if = "SchematicConfig::is_empty")]
+    pub schematic: SchematicConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -148,6 +152,7 @@ impl Project {
             pins: BTreeMap::new(),
             peripherals: BTreeMap::new(),
             codegen: CodegenOptions::default(),
+            schematic: SchematicConfig::default(),
         }
     }
 

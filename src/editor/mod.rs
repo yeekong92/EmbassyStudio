@@ -1,8 +1,9 @@
-//! Main editor: pinout, clock tree, peripherals and generated code preview.
+//! Main editor: pinout, schematic overlay, clock tree, peripherals and generated code preview.
 
 mod clock_view;
 mod peripherals;
 mod pinout;
+mod schematic_view;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use crate::theme;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Pinout,
+    Schematic,
     Clock,
     Code,
 }
@@ -42,6 +44,12 @@ pub struct Editor {
     pin_search: String,
     /// Open pin popup (left-click function list or right-click label editor).
     pin_popup: Option<pinout::PinPopup>,
+    /// Pan / zoom of the clock tree.
+    clock_cam: clock_view::Camera,
+    /// Open drop-down on the clock tree.
+    clock_popup: Option<clock_view::ClockPopup>,
+    /// Schematic tab: view, calibration draft and background images.
+    sch: schematic_view::SchState,
     dirty: bool,
     generate_when_ready: bool,
     preview: Vec<GenFile>,
@@ -66,6 +74,9 @@ impl Editor {
             pin_view: pinout::PinView::default(),
             pin_search: String::new(),
             pin_popup: None,
+            clock_cam: clock_view::Camera::default(),
+            clock_popup: None,
+            sch: schematic_view::SchState::default(),
             dirty: false,
             generate_when_ready: generate,
             preview: Vec::new(),
@@ -83,12 +94,14 @@ impl Editor {
     }
 
     pub fn save_quiet(&mut self) {
+        self.schematic_commit();
         if self.dirty && self.project.save(&self.dir).is_ok() {
             self.dirty = false;
         }
     }
 
     fn save(&mut self, actions: &mut Vec<Action>) {
+        self.schematic_commit();
         match self.project.save(&self.dir) {
             Ok(()) => {
                 self.dirty = false;
@@ -99,6 +112,7 @@ impl Editor {
     }
 
     fn generate(&mut self, actions: &mut Vec<Action>) {
+        self.schematic_commit();
         let Some(chip) = &self.chip else { return };
         if let Err(e) = self.project.save(&self.dir) {
             actions.push(Action::Notify(format!("Save failed: {e:#}"), true));
@@ -216,11 +230,19 @@ impl Editor {
                 .min_size(240.0)
                 .show(ui, |ui| self.pin_inspector(ui, &chip));
         }
+        if self.tab == Tab::Schematic {
+            egui::Panel::right("schematic_inspector")
+                .resizable(true)
+                .default_size(300.0)
+                .min_size(240.0)
+                .show(ui, |ui| self.schematic_panel(ui, &chip));
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| match self.tab {
                 Tab::Pinout => self.pinout(ui, &chip),
+                Tab::Schematic => self.schematic_view(ui, &chip, actions),
                 Tab::Clock => self.clock_view(ui),
                 Tab::Code => self.code_view(ui, &chip),
             });
@@ -282,7 +304,7 @@ impl Editor {
                         ui.label(RichText::new("●").color(theme::WARN)).on_hover_text("Unsaved changes");
                     }
                     ui.add_space(16.0);
-                    for (tab, label) in [(Tab::Pinout, "Pinout"), (Tab::Clock, "Clock Configuration"), (Tab::Code, "Code Preview")] {
+                    for (tab, label) in [(Tab::Pinout, "Pinout"), (Tab::Schematic, "Schematic"), (Tab::Clock, "Clock Configuration"), (Tab::Code, "Code Preview")] {
                         if ui.selectable_label(self.tab == tab, RichText::new(label).size(14.0)).clicked() {
                             self.tab = tab;
                         }

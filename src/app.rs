@@ -38,7 +38,7 @@ pub struct Data {
 }
 
 impl Data {
-    fn new(ctx: egui::Context, source: DataSource) -> Self {
+    pub(crate) fn new(ctx: egui::Context, source: DataSource) -> Self {
         let (tx, rx) = channel();
         let mut data = Self {
             index: if source == DataSource::GitHub { ChipIndex::load_cached() } else { None },
@@ -118,7 +118,7 @@ impl Data {
         Load::Loading
     }
 
-    fn poll(&mut self) {
+    pub(crate) fn poll(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Index(Ok(index)) => {

@@ -34,7 +34,7 @@ pub struct PinPopup {
 }
 
 impl PinPopup {
-    fn new(gpio: String, kind: PinPopupKind, label: String) -> Self {
+    pub(super) fn new(gpio: String, kind: PinPopupKind, label: String) -> Self {
         Self { gpio, kind, opening: true, label }
     }
 }
@@ -460,7 +460,7 @@ impl Editor {
     }
 
     /// The open pin popup: function list (left-click) or label editor (right-click).
-    fn show_pin_popup(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn show_pin_popup(&mut self, ui: &mut egui::Ui) {
         let Some(mut pp) = self.pin_popup.take() else { return };
         let id = egui::Id::unique(("pin_popup", &pp.gpio, pp.kind));
         let opening = std::mem::take(&mut pp.opening);
@@ -631,7 +631,7 @@ impl Editor {
         }
     }
 
-    fn gpio_settings(&mut self, ui: &mut egui::Ui, gpio: &str) {
+    pub(super) fn gpio_settings(&mut self, ui: &mut egui::Ui, gpio: &str) {
         let current = self.project.pins.get(gpio).cloned();
         let label = current.as_ref().map(|c| c.mode.label()).unwrap_or_else(|| "Reset_State".into());
         ui.horizontal(|ui| {
@@ -708,7 +708,7 @@ impl Editor {
     }
 }
 
-fn draw_grid(painter: &egui::Painter, rect: Rect) {
+pub(super) fn draw_grid(painter: &egui::Painter, rect: Rect) {
     let step = 24.0;
     let color = Color32::from_rgb(0x1c, 0x1f, 0x25);
     let mut x = rect.left();

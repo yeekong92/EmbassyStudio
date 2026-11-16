@@ -1,43 +1,76 @@
-//! Clock configuration, laid out like STM32CubeMX:
-//! input sources → PLLs → system clock mux → AHB/APB buses → outputs, then clock
-//! outputs (MCO, RTC, LSCO) and every peripheral kernel-clock mux below.
+//! Clock configuration drawn like the STM32CubeMX clock tree.
 //!
-//! Everything is driven by the RCC description discovered in `crate::clock`, so the
-//! same view serves every STM32 family.
+//! Left to right: clock sources (low-speed group with the RTC mux and IWDG on
+//! top, high-speed sources below), the PLL source mux and one frame per PLL,
+//! the System Clock Mux with SYSCLK → AHB → HCLK, and the bus outputs on the
+//! right ("To Power", "HCLK to AHB bus…", Cortex timer, FCLK, APBx peripheral
+//! and timer clocks). Peripheral clock muxes, MCO and LSCO sit underneath.
+//!
+//! Muxes are trapezoids with one radio input per choice, dividers are boxes
+//! with a drop-down, frequencies are read-out boxes, wires are orthogonal and
+//! highlighted along the active path. Everything is generated from the RCC
+//! description in `crate::clock`, so the same layout serves every STM32 family.
+//!
+//! The whole tree is painted in canvas units and scaled, so it can be zoomed
+//! and panned; drop-downs and frequency editors open as normal-size popups.
 
 use std::collections::BTreeMap;
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, StrokeKind, pos2, vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Shape, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 use super::Editor;
 use crate::clock::{ClockConfig, ClockTree, Role, Selector, factor, format_hz, oscillator_base};
 use crate::db::KernelClock;
 use crate::theme;
 
-// Column positions (canvas units).
-const OSC_X: f32 = 0.0;
-const OSC_W: f32 = 190.0;
-const PLL_X: f32 = 218.0;
-const PLL_W: f32 = 600.0;
-const SYS_X: f32 = 848.0;
-const AHB_X: f32 = 1020.0;
-const OUT_X: f32 = 1182.0;
-const OUT_W: f32 = 226.0;
-const GRID_X: f32 = 848.0;
-const GRID_W: f32 = 180.0;
-const GRID_COLS: usize = 3;
-const CANVAS_W: f32 = 1412.0;
+// ---- layout (canvas units) ----
+const SRC_W: f32 = 96.0;
+const GUTTER_X: f32 = 110.0;
+const GUTTER_STEP: f32 = 8.0;
+const MUX_W: f32 = 26.0;
+const MUX_STEP: f32 = 16.0;
+const MUX_B_X: f32 = 252.0;
+const RTC_OUT_X: f32 = 300.0;
+const PLL_X: f32 = 312.0;
+const PLL_W: f32 = 296.0;
+const SYS_GX: f32 = 630.0;
+const SYS_MUX_X: f32 = 712.0;
+const SYSCLK_X: f32 = 758.0;
+const AHB_X: f32 = 856.0;
+const HCLK_X: f32 = 924.0;
+const TRUNK_X: f32 = 1008.0;
+const PRE_X: f32 = 1016.0;
+const BRANCH_X: f32 = 1062.0;
+const OUT_X: f32 = 1100.0;
+const ROW: f32 = 28.0;
+const BOX_H: f32 = 20.0;
+const CANVAS_W: f32 = 1400.0;
+const GRID_COLS: usize = 4;
 
-const DIM_WIRE: Color32 = Color32::from_rgb(0x3a, 0x40, 0x4b);
+const WIRE_OFF: Color32 = Color32::from_rgb(0x46, 0x4c, 0x58);
 const OFF_FILL: Color32 = Color32::from_rgb(0x1e, 0x21, 0x27);
-const OFF_TEXT: Color32 = Color32::from_rgb(0x5d, 0x64, 0x70);
+const OFF_TEXT: Color32 = Color32::from_rgb(0x6a, 0x71, 0x7e);
+const LABEL: Color32 = Color32::from_rgb(0xa4, 0xab, 0xb8);
 
-/// Friendly display for a variant: `Div4` -> `/4`, `Mul168` -> `×168`, `Range4M` -> `4 MHz`.
+/// Friendly display for a variant: `Div4` -> `/4`, `Mul168` -> `X 168`, `Range4M` -> `4 MHz`.
 fn pretty(variant: &str) -> String {
     match factor(variant) {
-        Some(f) if f >= 1.0 && variant.to_ascii_lowercase().starts_with("mul") => format!("×{}", trim(f)),
+        Some(f) if f >= 1.0 && variant.to_ascii_lowercase().starts_with("mul") => format!("X {}", trim(f)),
         Some(f) if f > 0.0 => format!("/{}", trim(1.0 / f)),
-        _ => variant.strip_prefix("Range").map(|r| r.replace('K', " kHz").replace('M', " MHz")).unwrap_or_else(|| variant.to_string()),
+        // Oscillator ranges: `Range4M` (L4), `RANGE_4MHZ` (U5) -> `4 MHz`.
+        _ if variant.to_ascii_uppercase().starts_with("RANGE") => {
+            crate::clock::range_frequency(variant).map(format_hz).unwrap_or_else(|| variant.to_string())
+        }
+        _ => variant.to_string(),
+    }
+}
+
+/// Name of a mux input as CubeMX prints it.
+fn input_label(variant: &str) -> String {
+    match variant {
+        "SYS" => "SYSCLK".into(),
+        v if v.starts_with("DISABLE") => "None".into(),
+        v => v.to_string(),
     }
 }
 
@@ -46,63 +79,46 @@ fn trim(v: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-fn wire(out: &mut Vec<egui::Shape>, from: Pos2, to: Pos2, active: bool) {
-    let dx = ((to.x - from.x) * 0.5).max(30.0);
-    let color = if active { theme::ACCENT } else { DIM_WIRE };
-    let width = if active { 2.2 } else { 1.2 };
-    let shape = egui::epaint::CubicBezierShape::from_points_stroke(
-        [from, from + vec2(dx, 0.0), to - vec2(dx, 0.0), to],
-        false,
-        Color32::TRANSPARENT,
-        Stroke::new(width, color),
-    );
-    out.push(shape.into());
-    out.push(egui::Shape::circle_filled(to, if active { 3.0 } else { 2.0 }, color));
+/// Pan / zoom of the clock canvas.
+pub struct Camera {
+    zoom: f32,
+    pan: Vec2,
+    /// Fit the width on the next frame (first show, or the Fit button).
+    fit: bool,
+    /// Height of the drawn tree, for pan limits.
+    content_h: f32,
 }
 
-fn node(painter: &egui::Painter, rect: Rect, title: &str, active: bool) {
-    painter.rect(
-        rect,
-        6.0,
-        if active { theme::CARD } else { OFF_FILL },
-        Stroke::new(1.0, if active { theme::ACCENT_DIM } else { theme::BORDER }),
-        StrokeKind::Inside,
-    );
-    painter.text(
-        rect.left_top() + vec2(10.0, 7.0),
-        Align2::LEFT_TOP,
-        title,
-        FontId::proportional(11.5),
-        if active { theme::TEXT_DIM } else { OFF_TEXT },
-    );
+impl Default for Camera {
+    fn default() -> Self {
+        Self { zoom: 1.0, pan: Vec2::ZERO, fit: true, content_h: 1200.0 }
+    }
 }
 
-/// Frequency read-out at the bottom-left of a node.
-fn freq(painter: &egui::Painter, rect: Rect, label: &str, hz: f64, active: bool) {
-    let text = if label.is_empty() { format_hz(hz) } else { format!("{label} {}", format_hz(hz)) };
-    painter.text(
-        rect.left_bottom() + vec2(10.0, -7.0),
-        Align2::LEFT_BOTTOM,
-        text,
-        FontId::monospace(11.5),
-        if active && hz > 0.0 { theme::ACCENT } else { theme::TEXT_DIM },
-    );
+/// What a drop-down writes back to.
+#[derive(Clone)]
+enum Target {
+    Role(Role),
+    Apb(String),
+    Value,
 }
 
-fn section_title(painter: &egui::Painter, pos: Pos2, text: &str) {
-    painter.text(pos, Align2::LEFT_BOTTOM, text, FontId::proportional(11.0), theme::TEXT_DIM);
+#[derive(Clone)]
+enum PopupKind {
+    Choose { sel: Selector, target: Target, current: String },
+    Freq(String),
+    Systick,
 }
 
-/// Input of a node: middle of its left edge, at the height of the title row.
-fn input(rect: Rect) -> Pos2 {
-    pos2(rect.left(), rect.top() + 34.0)
+/// An open drop-down or frequency editor.
+pub struct ClockPopup {
+    kind: PopupKind,
+    anchor: Pos2,
+    opening: bool,
 }
 
-fn output(rect: Rect) -> Pos2 {
-    pos2(rect.right(), rect.top() + 34.0)
-}
-
-/// What to change in the project after drawing a frame.
+/// A change to the project, applied after the frame is drawn.
+#[derive(Clone)]
 enum Edit {
     Role(Role, String),
     Apb(String, String),
@@ -113,41 +129,282 @@ enum Edit {
     OscEnabled(String, bool),
     OscFreq(String, f64),
     HseBypass(bool),
+    Systick(bool),
 }
 
-/// Everything needed to draw one PLL (main or extra) the same way.
+#[derive(Clone)]
+enum Action {
+    Edit(Edit),
+    Popup(PopupKind),
+}
+
+struct Hit {
+    rect: Rect,
+    action: Option<Action>,
+    tip: String,
+}
+
+/// One input of a mux.
+struct MuxIn {
+    label: String,
+    selected: bool,
+    action: Action,
+    tip: String,
+}
+
+/// Painter in canvas units.
+struct Cv {
+    painter: egui::Painter,
+    origin: Pos2,
+    z: f32,
+    hover: Option<Pos2>,
+    wires: Vec<Shape>,
+    hits: Vec<Hit>,
+}
+
+impl Cv {
+    fn p(&self, m: Pos2) -> Pos2 {
+        self.origin + m.to_vec2() * self.z
+    }
+
+    fn r(&self, x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect::from_min_size(self.p(pos2(x, y)), vec2(w, h) * self.z)
+    }
+
+    fn font(&self, size: f32) -> FontId {
+        FontId::proportional(size * self.z)
+    }
+
+    fn mono(&self, size: f32) -> FontId {
+        FontId::monospace(size * self.z)
+    }
+
+    fn text(&self, at: Pos2, align: Align2, text: impl ToString, size: f32, color: Color32) {
+        self.painter.text(self.p(at), align, text.to_string(), self.font(size), color);
+    }
+
+    fn hovered(&self, rect: Rect) -> bool {
+        self.hover.is_some_and(|h| rect.contains(h))
+    }
+
+    /// Orthogonal wire through model points.
+    fn wire(&mut self, pts: &[Pos2], on: bool) {
+        let pts: Vec<Pos2> = pts.iter().map(|p| self.p(*p)).collect();
+        let stroke = if on { Stroke::new(1.8 * self.z.max(0.6), theme::ACCENT) } else { Stroke::new(1.0 * self.z.max(0.6), WIRE_OFF) };
+        self.wires.push(Shape::line(pts, stroke));
+    }
+
+    fn dot(&mut self, at: Pos2, on: bool) {
+        let c = self.p(at);
+        self.wires.push(Shape::circle_filled(c, 2.6 * self.z, if on { theme::ACCENT } else { WIRE_OFF }));
+    }
+
+    fn hit(&mut self, rect: Rect, action: Option<Action>, tip: impl ToString) {
+        self.hits.push(Hit { rect, action, tip: tip.to_string() });
+    }
+
+    /// Frequency read-out box. Returns its right-middle point.
+    fn vbox(&mut self, x: f32, y: f32, w: f32, hz: f64, on: bool, action: Option<Action>, tip: &str) -> Pos2 {
+        let r = self.r(x, y, w, BOX_H);
+        let editable = action.is_some();
+        let hot = editable && self.hovered(r);
+        self.painter.rect(
+            r,
+            3.0 * self.z,
+            if on { theme::CARD } else { OFF_FILL },
+            Stroke::new(1.0, if hot { theme::ACCENT } else if editable { LABEL } else if on { theme::ACCENT_DIM } else { theme::BORDER }),
+            StrokeKind::Inside,
+        );
+        let text = if hz > 0.0 { format_hz(hz) } else { "0".into() };
+        self.painter.text(r.center(), Align2::CENTER_CENTER, text, self.mono(10.5), if on && hz > 0.0 { theme::ACCENT } else { OFF_TEXT });
+        self.hit(r, action, tip);
+        pos2(x + w, y + BOX_H / 2.0)
+    }
+
+    /// Drop-down box (divider, multiplier, prescaler, range). Returns its right-middle point.
+    fn sbox(&mut self, x: f32, y: f32, w: f32, text: &str, on: bool, action: Option<Action>, tip: &str) -> Pos2 {
+        let r = self.r(x, y, w, BOX_H);
+        let clickable = action.is_some();
+        let hot = clickable && self.hovered(r);
+        self.painter.rect(
+            r,
+            2.0 * self.z,
+            if hot { theme::CARD_HOVER } else if on { Color32::from_rgb(0x2a, 0x2f, 0x39) } else { OFF_FILL },
+            Stroke::new(1.0, if hot { theme::ACCENT } else { theme::BORDER }),
+            StrokeKind::Inside,
+        );
+        let color = if on { theme::TEXT } else { OFF_TEXT };
+        if clickable {
+            self.painter.text(r.left_center() + vec2(5.0 * self.z, 0.0), Align2::LEFT_CENTER, text, self.mono(10.5), color);
+            self.painter.text(r.right_center() - vec2(4.0 * self.z, 0.0), Align2::RIGHT_CENTER, "▾", self.font(8.0), OFF_TEXT);
+        } else {
+            self.painter.text(r.center(), Align2::CENTER_CENTER, text, self.mono(10.5), color);
+        }
+        self.hit(r, action, tip);
+        pos2(x + w, y + BOX_H / 2.0)
+    }
+
+    fn check(&mut self, x: f32, y: f32, on: bool, action: Action, tip: &str) {
+        let r = self.r(x, y, 10.0, 10.0);
+        let hot = self.hovered(r.expand(2.0));
+        self.painter.rect(
+            r,
+            2.0 * self.z,
+            if on { theme::ACCENT_DIM } else { OFF_FILL },
+            Stroke::new(1.0, if hot { theme::ACCENT } else { LABEL }),
+            StrokeKind::Inside,
+        );
+        if on {
+            // Tick drawn as lines: not every font has a check-mark glyph.
+            let pts = [r.left_top() + vec2(0.22, 0.52) * r.width(), r.left_top() + vec2(0.42, 0.74) * r.width(), r.left_top() + vec2(0.80, 0.26) * r.width()];
+            self.painter.add(Shape::line(pts.to_vec(), Stroke::new(1.6 * self.z.max(0.7), theme::TEXT)));
+        }
+        self.hit(r.expand(3.0 * self.z), Some(action), tip);
+    }
+
+    /// Trapezoid mux with radio inputs on the left. Returns the input attach
+    /// points (left edge), the output point and the bottom y.
+    fn mux(&mut self, x: f32, top: f32, inputs: Vec<MuxIn>, on: bool) -> (Vec<Pos2>, Pos2, f32) {
+        let n = inputs.len().max(1) as f32;
+        let h = n * MUX_STEP + 8.0;
+        let inset = (h * 0.16).min(10.0);
+        let pts = [pos2(x, top), pos2(x + MUX_W, top + inset), pos2(x + MUX_W, top + h - inset), pos2(x, top + h)];
+        let screen: Vec<Pos2> = pts.iter().map(|p| self.p(*p)).collect();
+        self.painter.add(Shape::convex_polygon(
+            screen,
+            if on { Color32::from_rgb(0x23, 0x30, 0x2e) } else { OFF_FILL },
+            Stroke::new(1.0, if on { theme::ACCENT_DIM } else { theme::BORDER }),
+        ));
+        let mut attach = Vec::new();
+        for (i, input) in inputs.into_iter().enumerate() {
+            let y = top + 4.0 + MUX_STEP / 2.0 + i as f32 * MUX_STEP;
+            let c = self.p(pos2(x + 8.0, y));
+            let rad = 4.2 * self.z;
+            let hot = self.hover.is_some_and(|h| h.distance(c) < rad * 2.2);
+            self.painter.circle(c, rad, OFF_FILL, Stroke::new(1.0, if hot { theme::ACCENT } else { LABEL }));
+            if input.selected {
+                self.painter.circle_filled(c, rad * 0.55, theme::ACCENT);
+            }
+            self.text(
+                pos2(x - 3.0, y - 1.5),
+                Align2::RIGHT_BOTTOM,
+                &input.label,
+                9.0,
+                if input.selected && on { theme::ACCENT } else { LABEL },
+            );
+            self.hit(Rect::from_center_size(c, Vec2::splat(rad * 4.0)), Some(input.action), input.tip);
+            attach.push(pos2(x, y));
+        }
+        (attach, pos2(x + MUX_W, top + h / 2.0), top + h)
+    }
+
+    fn frame(&self, x: f32, y: f32, w: f32, h: f32, on: bool) {
+        self.painter.rect(
+            self.r(x, y, w, h),
+            6.0 * self.z,
+            Color32::from_rgba_unmultiplied(0x24, 0x28, 0x30, if on { 70 } else { 30 }),
+            Stroke::new(1.0, if on { theme::ACCENT_DIM } else { theme::BORDER }),
+            StrokeKind::Inside,
+        );
+    }
+
+    /// Small caption above a box.
+    fn caption(&self, x: f32, y: f32, text: &str) {
+        self.text(pos2(x, y - 2.0), Align2::LEFT_BOTTOM, text, 9.0, LABEL);
+    }
+}
+
+/// Everything needed to draw one PLL frame.
 struct PllDraw<'a> {
     title: String,
     name: String,
+    main: bool,
     enabled: bool,
-    src: Option<(&'a Selector, String)>,
     m: Option<(&'a Selector, String)>,
+    /// /M shared with the main PLL (shown dimmed, not editable).
+    m_shared: Option<String>,
     n: (&'a Selector, String),
-    /// (letter, selector, current value, output active, frequency, main-PLL role)
+    /// (letter, selector, value, active, frequency, main role)
     outs: Vec<(char, &'a Selector, String, bool, Option<f64>, Option<Role>)>,
     pll_in: f64,
     vco: f64,
 }
 
 impl Editor {
-    /// A combo box for a selector placed at `rect`; returns the new value if changed.
-    fn selector_combo(ui: &mut egui::Ui, rect: Rect, sel: &Selector, current: &str) -> Option<String> {
-        let mut value = current.to_string();
-        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-            egui::ComboBox::from_id_salt(("clk", sel.key()))
-                .width(rect.width())
-                .height(400.0)
-                .selected_text(RichText::new(pretty(current)).monospace())
-                .show_ui(ui, |ui| {
-                    for v in &sel.variants {
-                        ui.selectable_value(&mut value, v.name.clone(), RichText::new(pretty(&v.name)).monospace())
-                            .on_hover_text(v.description.clone().unwrap_or_else(|| v.name.clone()));
+    pub(super) fn clock_view(&mut self, ui: &mut egui::Ui) {
+        let Some(tree) = self.tree.clone() else {
+            ui.centered_and_justified(|ui| ui.label("Loading RCC description…"));
+            return;
+        };
+        if tree.sys.is_none() {
+            ui.centered_and_justified(|ui| {
+                ui.label(format!("No system clock switch found in RCC '{}' data.", tree.rcc_version))
+            });
+            return;
+        }
+        self.clock_toolbar(ui, &tree);
+
+        let mut cam = std::mem::take(&mut self.clock_cam);
+        let mut edits = Vec::new();
+        let mut open = None;
+        self.clock_canvas(ui, &tree, &mut cam, &mut edits, &mut open);
+        self.clock_cam = cam;
+        if let Some(p) = open {
+            self.clock_popup = Some(p);
+        }
+        self.show_clock_popup(ui, &mut edits);
+
+        if !edits.is_empty() {
+            for e in edits {
+                self.apply_clock_edit(&tree, e);
+            }
+            self.mark_dirty();
+        }
+    }
+
+    fn clock_toolbar(&mut self, ui: &mut egui::Ui, tree: &ClockTree) {
+        let res = self.clocks.clone();
+        let mut reset = false;
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 6)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let chip = |ui: &mut egui::Ui, name: &str, hz: f64| {
+                    ui.label(RichText::new(name).size(11.5).color(theme::TEXT_DIM));
+                    ui.label(RichText::new(format_hz(hz)).monospace().strong().color(theme::ACCENT));
+                    ui.add_space(8.0);
+                };
+                chip(ui, "SYSCLK", res.sysclk);
+                chip(ui, "HCLK", res.hclk);
+                for (bus, _, f) in &res.apb {
+                    chip(ui, bus, *f);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    reset = ui.button("Reset clocks").on_hover_text("Back to the reset configuration of the RCC").clicked();
+                    ui.separator();
+                    if ui.button("+").on_hover_text("Zoom in (Ctrl+wheel)").clicked() {
+                        self.clock_cam.zoom = (self.clock_cam.zoom * 1.2).min(2.5);
                     }
+                    if ui.button("Fit").on_hover_text("Fit the tree to the window width").clicked() {
+                        self.clock_cam.fit = true;
+                    }
+                    if ui.button("−").on_hover_text("Zoom out (Ctrl+wheel)").clicked() {
+                        self.clock_cam.zoom = (self.clock_cam.zoom / 1.2).max(0.35);
+                    }
+                    ui.label(RichText::new(format!("{:.0}%", self.clock_cam.zoom * 100.0)).size(11.0).color(theme::TEXT_DIM));
+                    ui.separator();
+                    let (txt, color) = match crate::codegen::rcc_flavor(tree) {
+                        crate::codegen::RccFlavor::SummaryOnly => (format!("RCC '{}': board.rs gets these as comments", tree.rcc_version), theme::WARN),
+                        _ => (format!("RCC '{}': clock code generated", tree.rcc_version), theme::TEXT_DIM),
+                    };
+                    ui.label(RichText::new(txt).size(11.0).color(color));
                 });
-        })
-        .response
-        .on_hover_text(format!("{}  ({})", sel.key(), sel.enum_name));
-        (value != current).then_some(value)
+            });
+        });
+        ui.separator();
+        if reset {
+            self.project.clock = ClockConfig::default();
+            self.project.clock.normalize(tree);
+            self.mark_dirty();
+        }
     }
 
     fn apply_clock_edit(&mut self, tree: &ClockTree, edit: Edit) {
@@ -156,6 +413,9 @@ impl Editor {
             Edit::Role(role, v) => {
                 if role == Role::Sys && v.starts_with("PLL") {
                     clk.pll_enabled = true;
+                }
+                if let Some(base) = oscillator_base(&v).filter(|b| tree.oscillators.contains(b)) {
+                    clk.enabled.insert(base, true);
                 }
                 clk.roles.insert(role, v);
             }
@@ -173,6 +433,10 @@ impl Editor {
                         clk.aux_pll_enabled.insert(pll.name.clone(), true);
                     }
                 }
+                // A source picked in a mux is switched on too.
+                if let Some(base) = oscillator_base(&v).filter(|b| tree.oscillators.contains(b)) {
+                    clk.enabled.insert(base, true);
+                }
                 clk.set_value(&sel, v);
             }
             Edit::PllEnabled(on) => clk.pll_enabled = on,
@@ -189,184 +453,294 @@ impl Editor {
                 clk.oscillators.insert(name, hz);
             }
             Edit::HseBypass(on) => clk.hse_bypass = on,
+            Edit::Systick(div8) => clk.systick_div8 = div8,
         }
     }
 
-    pub(super) fn clock_view(&mut self, ui: &mut egui::Ui) {
-        let Some(tree) = self.tree.clone() else {
-            ui.centered_and_justified(|ui| ui.label("Loading RCC description…"));
-            return;
-        };
-        if tree.sys.is_none() {
-            ui.centered_and_justified(|ui| {
-                ui.label(format!("No system clock switch found in RCC '{}' data.", tree.rcc_version))
-            });
-            return;
-        }
-        let mut edits: Vec<Edit> = Vec::new();
-        self.clock_toolbar(ui, &tree);
-        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-            self.clock_canvas(ui, &tree, &mut edits);
-        });
-        if !edits.is_empty() {
-            for e in edits {
-                self.apply_clock_edit(&tree, e);
-            }
-            self.mark_dirty();
-        }
-    }
-
-    fn clock_toolbar(&mut self, ui: &mut egui::Ui, tree: &ClockTree) {
-        let res = self.clocks.clone();
-        let mut reset = false;
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let chip = |ui: &mut egui::Ui, name: &str, hz: f64| {
-                    ui.label(RichText::new(name).size(11.5).color(theme::TEXT_DIM));
-                    ui.label(RichText::new(format_hz(hz)).monospace().strong().color(theme::ACCENT));
-                    ui.add_space(10.0);
-                };
-                chip(ui, "SYSCLK", res.sysclk);
-                chip(ui, "HCLK", res.hclk);
-                for (bus, _, f) in &res.apb {
-                    chip(ui, bus, *f);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    reset = ui.button("Reset clocks").on_hover_text("Back to the reset configuration of the RCC").clicked();
-                    let (txt, color) = match crate::codegen::rcc_flavor(tree) {
-                        crate::codegen::RccFlavor::SummaryOnly => (format!("RCC '{}': written to board.rs as comments", tree.rcc_version), theme::WARN),
-                        _ => (format!("RCC '{}': clock code generated", tree.rcc_version), theme::TEXT_DIM),
-                    };
-                    ui.label(RichText::new(txt).size(11.0).color(color));
-                });
-            });
-        });
-        ui.separator();
-        if reset {
-            self.project.clock = ClockConfig::default();
-            self.project.clock.normalize(tree);
-            self.mark_dirty();
-        }
-    }
-
-    fn clock_canvas(&self, ui: &mut egui::Ui, tree: &ClockTree, edits: &mut Vec<Edit>) {
-        let res = &self.clocks;
+    fn show_clock_popup(&mut self, ui: &mut egui::Ui, edits: &mut Vec<Edit>) {
+        let Some(mut pp) = self.clock_popup.take() else { return };
+        let id = egui::Id::unique("clock_popup");
+        let opening = std::mem::take(&mut pp.opening);
+        let mut keep = true;
         let clk = &self.project.clock;
-
-        // Peripheral users of every mux, for titles and highlighting.
-        let mut users: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
-        if let Some(chip) = &self.chip {
-            for p in chip.peripherals() {
-                if let Some(KernelClock::Mux(m)) = p.rcc.as_ref().and_then(|r| r.kernel_clock.as_ref()) {
-                    users
-                        .entry(format!("{}.{}", m.register, m.field))
-                        .or_default()
-                        .push((p.name.clone(), self.project.is_peripheral_enabled(&p.name)));
+        let shown = egui::Popup::new(id, ui.ctx().clone(), egui::PopupAnchor::Position(pp.anchor), ui.layer_id())
+            .kind(egui::PopupKind::Menu)
+            .layout(egui::Layout::top_down_justified(egui::Align::Min))
+            .style(egui::containers::menu::menu_style)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .open_memory(opening.then_some(egui::SetOpenCommand::Bool(true)))
+            .show(|ui| match &mut pp.kind {
+                PopupKind::Choose { sel, target, current } => {
+                    ui.set_min_width(140.0);
+                    ui.label(RichText::new(sel.key()).size(11.0).color(theme::TEXT_DIM));
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                        for v in &sel.variants {
+                            let r = ui
+                                .selectable_label(*current == v.name, RichText::new(pretty(&v.name)).monospace())
+                                .on_hover_text(v.description.clone().unwrap_or_else(|| v.name.clone()));
+                            if r.clicked() {
+                                edits.push(match target {
+                                    Target::Role(role) => Edit::Role(*role, v.name.clone()),
+                                    Target::Apb(field) => Edit::Apb(field.clone(), v.name.clone()),
+                                    Target::Value => Edit::Value(sel.clone(), v.name.clone()),
+                                });
+                                keep = false;
+                            }
+                        }
+                    });
                 }
-            }
+                PopupKind::Freq(osc) => {
+                    ui.label(RichText::new(format!("{osc} frequency")).strong());
+                    let mut mhz = clk.oscillators.get(osc.as_str()).copied().unwrap_or(0.0) / 1e6;
+                    let r = ui.add(egui::DragValue::new(&mut mhz).range(0.0..=200.0).speed(0.01).suffix(" MHz").max_decimals(6));
+                    if opening {
+                        r.request_focus();
+                    }
+                    if r.changed() {
+                        edits.push(Edit::OscFreq(osc.clone(), mhz * 1e6));
+                    }
+                    let external = osc.starts_with("HSE") || osc.starts_with("LSE");
+                    ui.label(
+                        RichText::new(if external { "Crystal / clock on your board" } else { "Nominal value of the internal RC" })
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                    if ui.button("Done").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        keep = false;
+                    }
+                }
+                PopupKind::Systick => {
+                    ui.label(RichText::new("Cortex System timer").size(11.0).color(theme::TEXT_DIM));
+                    ui.separator();
+                    for (div8, text) in [(false, "/1"), (true, "/8")] {
+                        if ui.selectable_label(clk.systick_div8 == div8, RichText::new(text).monospace()).clicked() {
+                            edits.push(Edit::Systick(div8));
+                            keep = false;
+                        }
+                    }
+                }
+            });
+        if shown.is_none() {
+            keep = false;
         }
-        let kernel: Vec<&Selector> = tree.muxes.iter().filter(|(k, _)| !ClockTree::is_system_mux(k)).map(|(_, s)| s).collect();
-        let outputs = tree.mcos.len() + tree.misc.len()
-            + tree.muxes.keys().filter(|k| k.ends_with(".RTCSEL") || k.ends_with(".LSCOSEL")).count();
-
-        // ---- size the canvas ----
-        let osc_step = 108.0;
-        let osc_bottom = tree.oscillators.len() as f32 * osc_step;
-        let pll_h = |outs: usize| 44.0 + (outs.max(1) as f32 * 82.0).max(110.0);
-        let main_outs = [&tree.pll_p, &tree.pll_q, &tree.pll_r].iter().filter(|s| s.is_some()).count();
-        let mut pll_bottom = if tree.has_pll() { pll_h(main_outs) } else { 60.0 };
-        for p in &tree.aux_plls {
-            pll_bottom += 30.0 + pll_h([&p.p, &p.q, &p.r].iter().filter(|s| s.is_some()).count());
+        if keep {
+            self.clock_popup = Some(pp);
+        } else {
+            egui::Popup::close_id(ui.ctx(), id);
         }
-        let apb_top = 160.0;
-        let right_bottom = apb_top + tree.apb.len() as f32 * 112.0;
-        let rows = |n: usize| n.div_ceil(GRID_COLS) as f32 * 96.0;
-        let grid_top = right_bottom.max(230.0) + 50.0;
-        let kernel_top = grid_top + rows(outputs) + 50.0;
-        let grid_bottom = kernel_top + rows(kernel.len());
-        let height = osc_bottom.max(pll_bottom).max(grid_bottom) + 90.0;
+    }
 
-        let (canvas, _) = ui.allocate_exact_size(vec2(CANVAS_W + 28.0, height), egui::Sense::hover());
-        let painter = ui.painter_at(canvas);
-        // Wires go underneath the nodes: reserve a slot now, fill it at the end.
-        let wire_slot = painter.add(egui::Shape::Noop);
-        let mut wires: Vec<egui::Shape> = Vec::new();
-        let o = canvas.min.to_vec2() + vec2(16.0, 44.0);
-        let at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(pos2(x, y) + o, vec2(w, h));
-        let put = |x: f32, y: f32| pos2(x, y) + o;
+    fn clock_canvas(&self, ui: &mut egui::Ui, tree: &ClockTree, cam: &mut Camera, edits: &mut Vec<Edit>, open: &mut Option<ClockPopup>) {
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, theme::BG);
 
-        for (x, t) in [(OSC_X, "INPUT SOURCES"), (PLL_X, "PLLs"), (SYS_X, "SYSTEM CLOCK MUX"), (AHB_X, "AHB"), (OUT_X, "BUS CLOCKS")] {
-            section_title(&painter, put(x, -14.0), t);
+        // ---- camera ----
+        if cam.fit {
+            cam.zoom = ((rect.width() - 40.0) / CANVAS_W).clamp(0.35, 1.6);
+            cam.pan = Vec2::ZERO;
+            cam.fit = false;
         }
-
-        // ---- input sources ----
-        let mut osc_out: BTreeMap<String, Pos2> = BTreeMap::new();
-        for (i, name) in tree.oscillators.iter().enumerate() {
-            let r = at(OSC_X, i as f32 * osc_step, OSC_W, osc_step - 12.0);
-            let enabled = clk.is_enabled(name);
-            let external = name.starts_with("HSE") || name.starts_with("LSE");
-            let kind = if external { "external" } else { "RC" };
-            node(&painter, r, &format!("{name}  ·  {kind}"), enabled);
-            osc_out.insert(name.clone(), output(r));
-            let mut en = enabled;
-            if ui
-                .put(Rect::from_min_size(r.right_top() + vec2(-28.0, 4.0), vec2(22.0, 20.0)), egui::Checkbox::without_text(&mut en))
-                .on_hover_text("Enable this source")
-                .changed()
-            {
-                edits.push(Edit::OscEnabled(name.clone(), en));
-            }
-            let row1 = Rect::from_min_size(r.left_top() + vec2(10.0, 28.0), vec2(120.0, 24.0));
-            let f_now = clk.osc_frequency(tree, name);
-            if let Some(sel) = tree.osc_range.get(name) {
-                if let Some(v) = Self::selector_combo(ui, row1, sel, clk.value(sel)) {
-                    edits.push(Edit::Value(sel.clone(), v));
+        if resp.hovered() {
+            let (scroll, zoom_delta, hover) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
+            if zoom_delta != 1.0 {
+                if let Some(h) = hover {
+                    let old_origin = rect.min + vec2(20.0, 20.0) + cam.pan;
+                    let model = (h - old_origin) / cam.zoom;
+                    cam.zoom = (cam.zoom * zoom_delta).clamp(0.35, 2.5);
+                    cam.pan = h - rect.min - vec2(20.0, 20.0) - model * cam.zoom;
                 }
             } else {
-                let mut mhz = clk.oscillators.get(name).copied().unwrap_or(0.0) / 1e6;
-                let drag = egui::DragValue::new(&mut mhz).range(0.0..=200.0).speed(0.01).suffix(" MHz").max_decimals(6);
-                let resp = ui.put(row1, drag).on_hover_text(if external {
-                    "Frequency of the crystal / clock on your board"
-                } else {
-                    "Nominal frequency of the internal RC oscillator"
-                });
-                if resp.changed() {
-                    edits.push(Edit::OscFreq(name.clone(), mhz * 1e6));
+                cam.pan += scroll;
+            }
+        }
+        if resp.dragged() {
+            cam.pan += resp.drag_delta();
+        }
+        let cw = CANVAS_W * cam.zoom;
+        let ch = cam.content_h * cam.zoom;
+        cam.pan.x = cam.pan.x.clamp((rect.width() - cw - 60.0).min(0.0), 40.0);
+        cam.pan.y = cam.pan.y.clamp((rect.height() - ch - 80.0).min(0.0), 40.0);
+
+        let wire_slot = painter.add(Shape::Noop);
+        let mut cv = Cv {
+            painter: painter.clone(),
+            origin: rect.min + vec2(20.0, 20.0) + cam.pan,
+            z: cam.zoom,
+            hover: resp.hover_pos(),
+            wires: Vec::new(),
+            hits: Vec::new(),
+        };
+        let bottom = self.draw_tree(&mut cv, tree);
+        cam.content_h = bottom + 40.0;
+        painter.set(wire_slot, Shape::Vec(std::mem::take(&mut cv.wires)));
+
+        // ---- interaction ----
+        let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
+        let target = pointer.and_then(|p| cv.hits.iter().rposition(|h| h.rect.contains(p)));
+        if let Some(i) = target {
+            let hit = &cv.hits[i];
+            if !hit.tip.is_empty() && !resp.dragged() {
+                resp.clone().on_hover_text_at_pointer(hit.tip.clone());
+            }
+            if hit.action.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                match hit.action.clone() {
+                    Some(Action::Edit(e)) => edits.push(e),
+                    Some(Action::Popup(kind)) => {
+                        *open = Some(ClockPopup { kind, anchor: hit.rect.left_bottom() + vec2(0.0, 2.0), opening: true });
+                    }
+                    None => {}
                 }
             }
-            let row2 = Rect::from_min_size(r.left_top() + vec2(10.0, 56.0), vec2(110.0, 22.0));
+        }
+        if resp.double_clicked() && target.is_none() {
+            cam.fit = true;
+        }
+
+        let strip = Rect::from_min_max(rect.left_bottom() - vec2(0.0, 24.0), rect.right_bottom());
+        painter.rect_filled(strip, 0.0, theme::BG);
+        painter.text(
+            rect.left_bottom() + vec2(10.0, -6.0),
+            Align2::LEFT_BOTTOM,
+            "Click a box or a mux input to change it  ·  Wheel: scroll  ·  Ctrl+wheel: zoom  ·  Drag: pan  ·  Double-click: fit",
+            FontId::proportional(11.0),
+            theme::TEXT_DIM,
+        );
+    }
+
+    /// Paint the whole tree; returns the bottom y in canvas units.
+    fn draw_tree(&self, cv: &mut Cv, tree: &ClockTree) -> f32 {
+        let clk = &self.project.clock;
+        let res = &self.clocks;
+        let on = |name: &str| clk.is_enabled(name);
+        let choose = |sel: &Selector, target: Target, current: &str| {
+            Action::Popup(PopupKind::Choose { sel: sel.clone(), target, current: current.to_string() })
+        };
+
+        // Sources: low-speed first (top band), then high-speed.
+        let low: Vec<&String> = tree.oscillators.iter().filter(|o| o.starts_with("LS")).collect();
+        let high: Vec<&String> = tree.oscillators.iter().filter(|o| !o.starts_with("LS")).collect();
+        let order: Vec<&String> = low.iter().chain(high.iter()).copied().collect();
+        let gutter = |name: &str| GUTTER_X + order.iter().position(|o| *o == name).unwrap_or(0) as f32 * GUTTER_STEP;
+
+        // Source output points and the wire attach points hanging off each source's gutter.
+        let mut src_out: BTreeMap<String, Pos2> = BTreeMap::new();
+        let mut taps: BTreeMap<String, Vec<(Pos2, bool)>> = BTreeMap::new();
+
+        let draw_source = |cv: &mut Cv, name: &str, y: f32, src_out: &mut BTreeMap<String, Pos2>| -> f32 {
+            let enabled = on(name);
+            let external = name.starts_with("HSE") || name.starts_with("LSE");
+            cv.check(0.0, y + 1.0, enabled, Action::Edit(Edit::OscEnabled(name.to_string(), !enabled)), "Enable this source");
+            let title = if external { name.to_string() } else { format!("{name} RC") };
+            cv.text(pos2(14.0, y), Align2::LEFT_TOP, title, 10.5, if enabled { theme::TEXT } else { OFF_TEXT });
+            let f = clk.osc_frequency(tree, name);
+            let out = if let Some(sel) = tree.osc_range.get(name) {
+                let cur = clk.value(sel);
+                cv.sbox(0.0, y + 16.0, SRC_W, &pretty(cur), enabled, Some(choose(sel, Target::Value, cur)), &format!("{name} range"))
+            } else {
+                let tip = if external { "Input frequency — click to edit" } else { "Nominal frequency — click to edit" };
+                cv.vbox(0.0, y + 16.0, SRC_W, f, enabled, Some(Action::Popup(PopupKind::Freq(name.to_string()))), tip)
+            };
+            src_out.insert(name.to_string(), out);
+            let mut h = 40.0;
+            // Per-source extras on a second line.
             if name.starts_with("HSE") {
-                let mut byp = clk.hse_bypass;
-                if ui.put(row2, egui::Checkbox::new(&mut byp, "Bypass")).on_hover_text("External clock signal instead of a crystal").changed() {
-                    edits.push(Edit::HseBypass(byp));
-                }
-            } else if name.starts_with("LSE") {
+                cv.check(0.0, y + 42.0, clk.hse_bypass, Action::Edit(Edit::HseBypass(!clk.hse_bypass)), "External clock instead of a crystal");
+                cv.text(pos2(14.0, y + 41.0), Align2::LEFT_TOP, "Bypass", 9.0, LABEL);
+                h += 16.0;
+            }
+            if name.starts_with("LSE") {
                 if let Some(sel) = &tree.lse_drive {
-                    painter.text(row2.left_center(), Align2::LEFT_CENTER, "Drive", FontId::proportional(11.0), theme::TEXT_DIM);
-                    if let Some(v) = Self::selector_combo(ui, row2.translate(vec2(40.0, 0.0)), sel, clk.value(sel)) {
-                        edits.push(Edit::Value(sel.clone(), v));
-                    }
+                    let cur = clk.value(sel);
+                    cv.text(pos2(0.0, y + 50.0), Align2::LEFT_CENTER, "Drive", 9.0, LABEL);
+                    cv.sbox(34.0, y + 40.0, SRC_W - 34.0, cur, enabled, Some(choose(sel, Target::Value, cur)), "LSE drive strength");
+                    h += 24.0;
                 }
             }
             if let Some(sel) = tree.osc_div.get(name) {
-                if let Some(v) = Self::selector_combo(ui, row2.with_max_x(row2.left() + 70.0), sel, clk.value(sel)) {
-                    edits.push(Edit::Value(sel.clone(), v));
+                let cur = clk.value(sel);
+                cv.text(pos2(0.0, y + 50.0), Align2::LEFT_CENTER, "Divider", 9.0, LABEL);
+                cv.sbox(44.0, y + 40.0, SRC_W - 44.0, &pretty(cur), enabled, Some(choose(sel, Target::Value, cur)), &sel.key());
+                h += 24.0;
+            }
+            h
+        };
+
+        // ---- low-speed band: LSE/LSI, RTC mux, IWDG ----
+        cv.text(pos2(0.0, -16.0), Align2::LEFT_TOP, "LOW-SPEED SOURCES", 9.0, theme::TEXT_DIM);
+        let mut y = 0.0;
+        for name in &low {
+            y += draw_source(cv, name, y, &mut src_out) + 10.0;
+        }
+        let mut band_bottom = y;
+        let mut rtc_bottom = 0.0;
+        if let Some((key, sel)) = tree.muxes.iter().find(|(k, _)| k.ends_with(".RTCSEL")) {
+            let cur = clk.value(sel).to_string();
+            let inputs: Vec<MuxIn> = sel
+                .variants
+                .iter()
+                .map(|v| MuxIn {
+                    label: input_label(&v.name),
+                    selected: v.name == cur,
+                    action: Action::Edit(Edit::Value(sel.clone(), v.name.clone())),
+                    tip: format!("{} = {}", key, v.name),
+                })
+                .collect();
+            cv.caption(MUX_B_X - 30.0, 2.0, "RTC Clock Mux");
+            let (attach, out, mb) = cv.mux(MUX_B_X, 4.0, inputs, true);
+            for (v, at) in sel.variants.iter().zip(&attach) {
+                if let Some(base) = oscillator_base(&v.name).filter(|b| src_out.contains_key(b)) {
+                    let active = v.name == cur && on(&base);
+                    taps.entry(base).or_default().push((*at, active));
                 }
             }
-            // Resulting frequency in the title row, left of the enable box.
-            painter.text(
-                r.right_top() + vec2(-34.0, 7.0),
-                Align2::RIGHT_TOP,
-                format_hz(f_now),
-                FontId::monospace(11.5),
-                if enabled { theme::ACCENT } else { theme::TEXT_DIM },
-            );
+            let f = res.kernel.get(key).copied().unwrap_or(0.0);
+            let bx = RTC_OUT_X + 16.0;
+            cv.wire(&[out, pos2(bx, out.y)], f > 0.0);
+            let end = cv.vbox(bx, out.y - BOX_H / 2.0, 72.0, f, f > 0.0, None, "RTC clock");
+            cv.text(end + vec2(6.0, 0.0), Align2::LEFT_CENTER, "To RTC", 10.0, LABEL);
+            rtc_bottom = mb;
+            band_bottom = band_bottom.max(mb);
+        }
+        let has_iwdg = self.chip.as_ref().is_some_and(|c| c.peripherals().iter().any(|p| p.name.starts_with("IWDG")));
+        if let (true, Some(lsi)) = (has_iwdg, low.iter().find(|o| o.starts_with("LSI"))) {
+            let yy = rtc_bottom + 12.0;
+            let bx = RTC_OUT_X + 16.0;
+            let f = res.resolve(lsi).unwrap_or(0.0);
+            taps.entry(lsi.to_string()).or_default().push((pos2(bx, yy + BOX_H / 2.0), f > 0.0));
+            let end = cv.vbox(bx, yy, 72.0, f, f > 0.0, None, "Independent watchdog clock (LSI)");
+            cv.text(end + vec2(6.0, 0.0), Align2::LEFT_CENTER, "To IWDG", 10.0, LABEL);
+            band_bottom = band_bottom.max(yy + BOX_H);
         }
 
+        // ---- lanes from sources to the System Clock Mux ----
+        let sys_sel = tree.sys.as_ref().unwrap();
+        let sys_inputs: Vec<&crate::db::EnumVariant> = sys_sel.variants.iter().filter(|v| !v.name.starts_with("DISABLE")).collect();
+        let lane_srcs: Vec<String> = sys_inputs
+            .iter()
+            .filter_map(|v| oscillator_base(&v.name).filter(|b| tree.oscillators.contains(b)))
+            .collect();
+        let lane_top = band_bottom + 22.0;
+        let lane_y = |i: usize| lane_top + i as f32 * 7.0;
+        let hs_top = lane_top + lane_srcs.len() as f32 * 7.0 + 34.0;
+
+        // ---- high-speed sources ----
+        cv.text(pos2(0.0, hs_top - 16.0), Align2::LEFT_TOP, "HIGH-SPEED SOURCES", 9.0, theme::TEXT_DIM);
+        let mut y = hs_top;
+        for name in &high {
+            y += draw_source(cv, name, y, &mut src_out) + 12.0;
+        }
+        let sources_bottom = y;
+
         // ---- PLLs ----
-        let mut y = 0.0;
-        let mut main_outputs: Vec<(char, Pos2)> = Vec::new();
+        let mut pll_bottom = hs_top;
+        let mut main_outs: Vec<(char, Pos2, bool)> = Vec::new();
         let mut main_src_out: Option<Pos2> = None;
+        let mut fy = hs_top;
         if tree.has_pll() {
             let n = tree.pll_n.as_ref().unwrap();
             let outs = [(Role::PllP, 'P', res.pll_p), (Role::PllQ, 'Q', res.pll_q), (Role::PllR, 'R', res.pll_r)]
@@ -378,23 +752,49 @@ impl Editor {
                 })
                 .collect();
             let draw = PllDraw {
-                title: format!("Main PLL  ({})", tree.main_pll),
+                title: format!("{}  (main PLL)", tree.main_pll),
                 name: tree.main_pll.clone(),
+                main: true,
                 enabled: clk.pll_enabled,
-                src: tree.pll_src.as_ref().map(|s| (s, clk.role(Role::PllSrc).unwrap_or("").to_string())),
                 m: tree.pll_m.as_ref().map(|s| (s, clk.role(Role::PllM).unwrap_or("").to_string())),
+                m_shared: None,
                 n: (n, clk.role(Role::PllN).unwrap_or("").to_string()),
                 outs,
                 pll_in: res.pll_in,
                 vco: res.vco,
             };
-            let (h, outs, src_out) = Self::draw_pll(ui, &painter, &mut wires, &at, y, &draw, &osc_out, None, edits, true);
-            main_outputs = outs;
-            main_src_out = src_out;
-            y += h + 30.0;
+            let (h, m_in, outs) = self.draw_pll(cv, fy, &draw);
+            main_outs = outs;
+            // PLL source mux, centred on the /M input.
+            if let Some(sel) = &tree.pll_src {
+                let cur = clk.role(Role::PllSrc).unwrap_or("").to_string();
+                let vars: Vec<&crate::db::EnumVariant> = sel.variants.iter().filter(|v| !v.name.starts_with("DISABLE")).collect();
+                let inputs: Vec<MuxIn> = vars
+                    .iter()
+                    .map(|v| MuxIn {
+                        label: input_label(&v.name),
+                        selected: v.name == cur,
+                        action: Action::Edit(Edit::Role(Role::PllSrc, v.name.clone())),
+                        tip: format!("{} = {}", sel.key(), v.name),
+                    })
+                    .collect();
+                let top = m_in.y - (vars.len() as f32 * MUX_STEP + 8.0) / 2.0;
+                cv.caption(MUX_B_X - 34.0, top - 2.0, "PLL Source Mux");
+                let (attach, out, mb) = cv.mux(MUX_B_X, top, inputs, clk.pll_enabled);
+                for (v, at) in vars.iter().zip(&attach) {
+                    if let Some(base) = oscillator_base(&v.name).filter(|b| src_out.contains_key(b)) {
+                        let active = clk.pll_enabled && v.name == cur && on(&base);
+                        taps.entry(base).or_default().push((*at, active));
+                    }
+                }
+                cv.wire(&[out, pos2(m_in.x, out.y)], clk.pll_enabled);
+                main_src_out = Some(out);
+                pll_bottom = pll_bottom.max(mb);
+            }
+            fy += h + 16.0;
         } else {
-            painter.text(put(PLL_X + 10.0, 10.0), Align2::LEFT_TOP, "No PLL in this RCC", FontId::proportional(12.0), theme::TEXT_DIM);
-            y += 60.0;
+            cv.text(pos2(PLL_X, hs_top), Align2::LEFT_TOP, "No PLL in this RCC", 10.0, theme::TEXT_DIM);
+            fy += 40.0;
         }
         for (pll, r) in tree.aux_plls.iter().zip(&res.aux) {
             let outs = ['P', 'Q', 'R']
@@ -407,308 +807,382 @@ impl Editor {
             let draw = PllDraw {
                 title: pll.name.clone(),
                 name: pll.name.clone(),
+                main: false,
                 enabled: r.enabled,
-                src: pll.src.as_ref().map(|s| (s, clk.value(s).to_string())),
                 m: pll.m.as_ref().map(|s| (s, clk.value(s).to_string())),
+                m_shared: pll.m.is_none().then(|| clk.role(Role::PllM).map(pretty).unwrap_or_default()).filter(|_| tree.pll_m.is_some()),
                 n: (&pll.n, clk.value(&pll.n).to_string()),
                 outs,
                 pll_in: r.pll_in,
                 vco: r.vco,
             };
-            let (h, _, _) = Self::draw_pll(ui, &painter, &mut wires, &at, y, &draw, &osc_out, main_src_out, edits, false);
-            y += h + 30.0;
+            let (h, m_in, _) = self.draw_pll(cv, fy, &draw);
+            if let Some(sel) = &pll.src {
+                // Own source mux (U5, F446 PLLI2S...).
+                let cur = clk.value(sel).to_string();
+                let vars: Vec<&crate::db::EnumVariant> = sel.variants.iter().filter(|v| !v.name.starts_with("DISABLE")).collect();
+                let inputs: Vec<MuxIn> = vars
+                    .iter()
+                    .map(|v| MuxIn {
+                        label: input_label(&v.name),
+                        selected: v.name == cur,
+                        action: Action::Edit(Edit::Value((*sel).clone(), v.name.clone())),
+                        tip: format!("{} = {}", sel.key(), v.name),
+                    })
+                    .collect();
+                let top = m_in.y - (vars.len() as f32 * MUX_STEP + 8.0) / 2.0;
+                let (attach, out, _) = cv.mux(MUX_B_X, top, inputs, r.enabled);
+                for (v, at) in vars.iter().zip(&attach) {
+                    if let Some(base) = oscillator_base(&v.name).filter(|b| src_out.contains_key(b)) {
+                        taps.entry(base.clone()).or_default().push((*at, r.enabled && v.name == cur && on(&base)));
+                    }
+                }
+                cv.wire(&[out, pos2(m_in.x, out.y)], r.enabled);
+            } else if let Some(out) = main_src_out {
+                // Shares the main PLL source: a bus down the left of the frames.
+                let bus_x = PLL_X - 10.0;
+                cv.wire(&[pos2(bus_x, out.y), pos2(bus_x, m_in.y), m_in], r.enabled);
+                cv.dot(pos2(bus_x, out.y), r.enabled);
+            }
+            fy += h + 16.0;
         }
+        pll_bottom = pll_bottom.max(fy);
 
-        // ---- SYSCLK mux ----
-        let sys_sel = tree.sys.as_ref().unwrap();
-        let sys_rect = at(SYS_X, 40.0, 150.0, 92.0);
-        node(&painter, sys_rect, "SYSCLK source", true);
+        // ---- System Clock Mux → SYSCLK → AHB → HCLK ----
+        let rows_top = hs_top - 4.0;
+        let chain_y = rows_top + ROW + BOX_H / 2.0;
         let sys_cur = clk.role(Role::Sys).unwrap_or("").to_string();
-        for v in &sys_sel.variants {
-            let from = if v.name.starts_with("PLL") {
+        let inputs: Vec<MuxIn> = sys_inputs
+            .iter()
+            .map(|v| MuxIn {
+                label: input_label(&v.name),
+                selected: v.name == sys_cur,
+                action: Action::Edit(Edit::Role(Role::Sys, v.name.clone())),
+                tip: format!("{} = {}", sys_sel.key(), v.name),
+            })
+            .collect();
+        let sys_h = sys_inputs.len() as f32 * MUX_STEP + 8.0;
+        let sys_top = (chain_y - sys_h / 2.0).max(hs_top - 6.0);
+        cv.caption(SYS_MUX_X - 40.0, sys_top - 2.0, "System Clock Mux");
+        let (attach, sys_out, sys_bottom) = cv.mux(SYS_MUX_X, sys_top, inputs, true);
+        for (k, (v, at)) in sys_inputs.iter().zip(&attach).enumerate() {
+            let gx = SYS_GX + k as f32 * 7.0;
+            let selected = v.name == sys_cur;
+            if v.name.starts_with("PLL") {
                 let letter = v.name.rsplit('_').next().and_then(|s| s.chars().next()).unwrap_or('P');
-                main_outputs.iter().find(|(l, _)| *l == letter).or(main_outputs.first()).map(|(_, p)| *p)
-            } else {
-                oscillator_base(&v.name).and_then(|b| osc_out.get(&b).copied())
-            };
-            if let Some(from) = from {
-                wire(&mut wires, from, input(sys_rect), v.name == sys_cur);
+                if let Some((_, from, active)) = main_outs.iter().find(|(l, _, _)| *l == letter).or(main_outs.first()) {
+                    cv.wire(&[*from, pos2(gx, from.y), pos2(gx, at.y), *at], selected && *active);
+                }
+            } else if let Some(base) = oscillator_base(&v.name).filter(|b| src_out.contains_key(b)) {
+                let lane = lane_srcs.iter().position(|s| *s == base).unwrap_or(0);
+                let ly = lane_y(lane);
+                let a = selected && on(&base);
+                cv.wire(&[pos2(gutter(&base), ly), pos2(gx, ly), pos2(gx, at.y), *at], a);
+                taps.entry(base.clone()).or_default().push((pos2(gutter(&base), ly), a));
             }
         }
-        if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(sys_rect.left_top() + vec2(8.0, 28.0), vec2(134.0, 24.0)), sys_sel, &sys_cur) {
-            edits.push(Edit::Role(Role::Sys, v));
-        }
-        freq(&painter, sys_rect, "SYSCLK", res.sysclk, true);
+        let chain_y = sys_out.y;
+        cv.caption(SYSCLK_X + 10.0, chain_y - BOX_H / 2.0, "SYSCLK");
+        cv.wire(&[sys_out, pos2(SYSCLK_X + 10.0, chain_y)], true);
+        let p = cv.vbox(SYSCLK_X + 10.0, chain_y - BOX_H / 2.0, 72.0, res.sysclk, true, None, "System clock");
+        cv.wire(&[p, pos2(AHB_X, chain_y)], true);
+        cv.caption(AHB_X, chain_y - BOX_H / 2.0, "AHB Prescaler");
+        let ahb_cur = clk.role(Role::Ahb).unwrap_or("").to_string();
+        let p = match &tree.ahb {
+            Some(sel) => cv.sbox(AHB_X, chain_y - BOX_H / 2.0, 54.0, &pretty(&ahb_cur), true, Some(choose(sel, Target::Role(Role::Ahb), &ahb_cur)), &sel.key()),
+            None => pos2(AHB_X + 54.0, chain_y),
+        };
+        cv.wire(&[p, pos2(HCLK_X, chain_y)], true);
+        cv.caption(HCLK_X, chain_y - BOX_H / 2.0, "HCLK");
+        let hclk_out = cv.vbox(HCLK_X, chain_y - BOX_H / 2.0, 72.0, res.hclk, true, None, "AHB clock");
 
-        // ---- AHB ----
-        let ahb_rect = at(AHB_X, 40.0, 140.0, 92.0);
-        node(&painter, ahb_rect, "AHB prescaler", true);
-        wire(&mut wires, output(sys_rect), input(ahb_rect), true);
-        if let Some(sel) = &tree.ahb {
-            let cur = clk.role(Role::Ahb).unwrap_or("");
-            if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(ahb_rect.left_top() + vec2(8.0, 28.0), vec2(124.0, 24.0)), sel, cur) {
-                edits.push(Edit::Role(Role::Ahb, v));
+        // ---- bus outputs (right column) ----
+        cv.text(pos2(OUT_X, rows_top - 20.0), Align2::LEFT_TOP, "OUTPUT CLOCKS", 9.0, theme::TEXT_DIM);
+        let mut row_y = rows_top;
+        let mut trunk_end = chain_y;
+        let out_row = |cv: &mut Cv, y: f32, hz: f64, label: &str, tip: &str| {
+            let end = cv.vbox(OUT_X, y, 72.0, hz, hz > 0.0, None, tip);
+            cv.text(end + vec2(8.0, 0.0), Align2::LEFT_CENTER, label, 10.0, LABEL);
+        };
+        // Branches off the HCLK trunk that runs down at TRUNK_X.
+        let branch = |cv: &mut Cv, y: f32, to_x: f32, trunk_end: &mut f32| {
+            let cy = y + BOX_H / 2.0;
+            cv.wire(&[pos2(TRUNK_X, cy), pos2(to_x, cy)], true);
+            if (cy - chain_y).abs() > 0.5 {
+                cv.dot(pos2(TRUNK_X, cy), true);
             }
+            *trunk_end = trunk_end.max(cy);
+        };
+        for label in ["To Power", "HCLK to AHB bus, core, memory and DMA"] {
+            branch(cv, row_y, OUT_X, &mut trunk_end);
+            out_row(cv, row_y, res.hclk, label, "HCLK");
+            row_y += ROW;
         }
-        freq(&painter, ahb_rect, "HCLK", res.hclk, true);
-
-        // ---- bus clocks ----
-        let hclk_rect = at(OUT_X, 0.0, OUT_W, 66.0);
-        node(&painter, hclk_rect, "HCLK → AHB bus, core, memory, DMA", true);
-        painter.text(hclk_rect.left_top() + vec2(10.0, 30.0), Align2::LEFT_TOP, format_hz(res.hclk), FontId::monospace(16.0), theme::ACCENT);
-        wire(&mut wires, output(ahb_rect), input(hclk_rect), true);
-
-        let tick_rect = at(OUT_X, 78.0, OUT_W, 66.0);
-        node(&painter, tick_rect, "Cortex System timer (SysTick)", true);
-        painter.text(
-            tick_rect.left_top() + vec2(10.0, 32.0),
-            Align2::LEFT_TOP,
-            format!("/1 {}   ·   /8 {}", format_hz(res.hclk), format_hz(res.hclk / 8.0)),
-            FontId::monospace(11.5),
-            theme::ACCENT,
-        );
-        wire(&mut wires, output(ahb_rect), input(tick_rect), true);
-
-        for (i, sel) in tree.apb.iter().enumerate() {
-            let rect = at(OUT_X, apb_top + i as f32 * 112.0, OUT_W, 100.0);
+        // Cortex System timer with its /1 or /8.
+        branch(cv, row_y, PRE_X, &mut trunk_end);
+        let st = if clk.systick_div8 { "/8" } else { "/1" };
+        let p = cv.sbox(PRE_X, row_y, 40.0, st, true, Some(Action::Popup(PopupKind::Systick)), "SysTick clock source (Cortex CLKSOURCE)");
+        cv.wire(&[p, pos2(OUT_X, p.y)], true);
+        out_row(cv, row_y, res.hclk / if clk.systick_div8 { 8.0 } else { 1.0 }, "To Cortex System timer", "SysTick");
+        row_y += ROW;
+        branch(cv, row_y, OUT_X, &mut trunk_end);
+        out_row(cv, row_y, res.hclk, "FCLK Cortex clock", "Free-running clock of the core");
+        row_y += ROW + 14.0;
+        for sel in &tree.apb {
             let (bus, f) = res.apb.iter().find(|(_, fld, _)| *fld == sel.field).map(|(b, _, f)| (b.clone(), *f)).unwrap_or_default();
             let tim = res.apb_timers.iter().find(|(b, _)| *b == bus).map(|(_, f)| *f).unwrap_or(f);
-            node(&painter, rect, &format!("{bus}  ·  {} prescaler", sel.field), true);
-            wire(&mut wires, output(ahb_rect), input(rect), true);
+            let n: String = bus.chars().filter(|c| c.is_ascii_digit()).collect();
+            let apb = format!("APB{n}");
+            cv.caption(PRE_X, row_y, &format!("{apb} Prescaler"));
+            branch(cv, row_y, PRE_X, &mut trunk_end);
             let cur = clk.apb.get(&sel.field).cloned().unwrap_or_default();
-            if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(rect.left_top() + vec2(8.0, 28.0), vec2(90.0, 24.0)), sel, &cur) {
-                edits.push(Edit::Apb(sel.field.clone(), v));
-            }
-            let mono = FontId::monospace(11.5);
-            painter.text(rect.left_top() + vec2(110.0, 30.0), Align2::LEFT_TOP, "peripherals", FontId::proportional(11.0), theme::TEXT_DIM);
-            painter.text(rect.right_top() + vec2(-10.0, 30.0), Align2::RIGHT_TOP, format_hz(f), mono.clone(), theme::ACCENT);
-            painter.text(rect.left_top() + vec2(110.0, 56.0), Align2::LEFT_TOP, "timers", FontId::proportional(11.0), theme::TEXT_DIM);
-            painter.text(rect.right_top() + vec2(-10.0, 56.0), Align2::RIGHT_TOP, format_hz(tim), mono, theme::ACCENT);
-            painter.text(
-                rect.left_bottom() + vec2(10.0, -7.0),
-                Align2::LEFT_BOTTOM,
-                if tim != f { "timers ×2 (prescaler ≠ 1)" } else { "timers = PCLK" },
-                FontId::proportional(10.5),
-                theme::TEXT_DIM,
-            );
+            let p = cv.sbox(PRE_X, row_y, 40.0, &pretty(&cur), true, Some(choose(sel, Target::Apb(sel.field.clone()), &cur)), &sel.key());
+            cv.wire(&[p, pos2(OUT_X, p.y)], true);
+            out_row(cv, row_y, f, &format!("{apb} peripheral clocks ({bus})"), &bus);
+            // Timer clocks: X 1 or X 2 after the prescaler.
+            let ty = row_y + ROW;
+            cv.wire(&[pos2(BRANCH_X - 6.0, p.y), pos2(BRANCH_X - 6.0, ty + BOX_H / 2.0), pos2(BRANCH_X, ty + BOX_H / 2.0)], true);
+            cv.dot(pos2(BRANCH_X - 6.0, p.y), true);
+            let mul = if tim > f { "X 2" } else { "X 1" };
+            let q = cv.sbox(BRANCH_X, ty, 30.0, mul, true, None, "Timers run at 2× PCLK when the APB prescaler divides");
+            cv.wire(&[q, pos2(OUT_X, q.y)], true);
+            out_row(cv, ty, tim, &format!("{apb} Timer clocks"), &format!("{bus}_TIM"));
+            row_y += 2.0 * ROW + 14.0;
         }
+        cv.wire(&[hclk_out, pos2(TRUNK_X, chain_y)], true);
+        cv.wire(&[pos2(TRUNK_X, rows_top + BOX_H / 2.0), pos2(TRUNK_X, trunk_end)], true);
+        let core_bottom = row_y.max(sys_bottom);
 
-        // ---- clock outputs, RTC and other choices ----
-        section_title(&painter, put(GRID_X, grid_top - 10.0), "CLOCK OUTPUTS · RTC · OTHER");
-        let mut cell = 0usize;
-        let mut next_cell = |top: f32| {
-            let r = at(GRID_X + (cell % GRID_COLS) as f32 * (GRID_W + 12.0), top + (cell / GRID_COLS) as f32 * 96.0, GRID_W, 84.0);
-            cell += 1;
-            r
-        };
-        for ((sel, pre), f) in tree.mcos.iter().zip(&res.mco) {
-            let r = next_cell(grid_top);
-            let cur = clk.value(sel);
-            let on = cur != "DISABLE" && !cur.starts_with("DISABLE") && *f > 0.0;
-            let pin = sel.field.trim_end_matches("SEL");
-            node(&painter, r, &format!("{pin} output (pin)"), on);
-            if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(r.left_top() + vec2(8.0, 28.0), vec2(if pre.is_some() { 100.0 } else { GRID_W - 16.0 }, 24.0)), sel, cur) {
-                edits.push(Edit::Value(sel.clone(), v));
+        // ---- source gutters (drawn once all taps are known) ----
+        for name in &order {
+            let Some(out) = src_out.get(name.as_str()) else { continue };
+            let list = taps.get(name.as_str()).cloned().unwrap_or_default();
+            if list.is_empty() {
+                continue;
             }
-            if let Some(pre) = pre {
-                if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(r.left_top() + vec2(114.0, 28.0), vec2(58.0, 24.0)), pre, clk.value(pre)) {
-                    edits.push(Edit::Value(pre.clone(), v));
+            let gx = gutter(name);
+            let any = list.iter().any(|(_, a)| *a);
+            cv.wire(&[*out, pos2(gx, out.y)], any);
+            let (lo, hi) = list.iter().map(|(p, _)| p.y).chain(std::iter::once(out.y)).fold((f32::MAX, f32::MIN), |(a, b), y| (a.min(y), b.max(y)));
+            cv.wire(&[pos2(gx, lo), pos2(gx, hi)], false);
+            for (p, active) in &list {
+                if *active {
+                    cv.wire(&[pos2(gx, out.y), pos2(gx, p.y)], true);
                 }
-            }
-            freq(&painter, r, "", *f, on);
-        }
-        for (key, sel) in tree.muxes.iter().filter(|(k, _)| k.ends_with(".RTCSEL") || k.ends_with(".LSCOSEL")) {
-            let r = next_cell(grid_top);
-            let f = res.kernel.get(key).copied().unwrap_or(0.0);
-            let rtc = key.ends_with(".RTCSEL");
-            // LSCO has a separate enable bit we do not model, so it only shows its source.
-            let title = if rtc { "RTC / LCD clock" } else { "LSCO output source" };
-            node(&painter, r, title, rtc && f > 0.0);
-            if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(r.left_top() + vec2(8.0, 28.0), vec2(GRID_W - 16.0, 24.0)), sel, clk.value(sel)) {
-                edits.push(Edit::Value(sel.clone(), v));
-            }
-            freq(&painter, r, "", f, rtc && f > 0.0);
-        }
-        for sel in &tree.misc {
-            let r = next_cell(grid_top);
-            let title = match sel.field.as_str() {
-                "STOPWUCK" => "Wake-up clock from Stop",
-                "STOPKERWUCK" => "Kernel wake-up clock from Stop",
-                "TIMPRE" => "Timer clock prescaler",
-                "LSIPREDIV" => "LSI prescaler",
-                other => other,
-            };
-            node(&painter, r, title, true);
-            if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(r.left_top() + vec2(8.0, 28.0), vec2(GRID_W - 16.0, 24.0)), sel, clk.value(sel)) {
-                edits.push(Edit::Value(sel.clone(), v));
-            }
-            painter.text(r.left_bottom() + vec2(10.0, -7.0), Align2::LEFT_BOTTOM, sel.key(), FontId::monospace(10.5), theme::TEXT_DIM);
-        }
-
-        // ---- peripheral kernel clocks ----
-        section_title(&painter, put(GRID_X, kernel_top - 10.0), "PERIPHERAL CLOCKS (kernel clock muxes)");
-        let mut cell = 0usize;
-        for sel in &kernel {
-            let r = at(GRID_X + (cell % GRID_COLS) as f32 * (GRID_W + 12.0), kernel_top + (cell / GRID_COLS) as f32 * 96.0, GRID_W, 84.0);
-            cell += 1;
-            let key = sel.key();
-            let list = users.get(&key).cloned().unwrap_or_default();
-            let any_enabled = list.iter().any(|(_, e)| *e);
-            let title = if list.is_empty() {
-                sel.field.trim_end_matches("SEL").to_string()
-            } else {
-                let names: Vec<&str> = list.iter().map(|(n, _)| n.as_str()).collect();
-                let joined = names.join(", ");
-                if joined.len() > 14 && names.len() > 1 { format!("{} +{}", names[0], names.len() - 1) } else { joined }
-            };
-            let f = res.kernel.get(&key).copied().unwrap_or(0.0);
-            node(&painter, r, &title, any_enabled);
-            painter.text(r.right_top() + vec2(-10.0, 8.0), Align2::RIGHT_TOP, &sel.field, FontId::monospace(10.0), OFF_TEXT);
-            let cur = clk.value(sel);
-            if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(r.left_top() + vec2(8.0, 28.0), vec2(GRID_W - 16.0, 24.0)), sel, cur) {
-                edits.push(Edit::Value((*sel).clone(), v));
-            }
-            let known = res.resolve(cur).is_some();
-            if known {
-                freq(&painter, r, "", f, any_enabled);
-            } else {
-                painter.text(r.left_bottom() + vec2(10.0, -7.0), Align2::LEFT_BOTTOM, "external clock", FontId::proportional(11.0), theme::TEXT_DIM);
-            }
-            if !list.is_empty() {
-                let tip = list
-                    .iter()
-                    .map(|(n, e)| format!("{n}{}", if *e { "  (enabled)" } else { "" }))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                ui.interact(Rect::from_min_size(r.left_top(), vec2(r.width(), 24.0)), ui.scope_id().with(("kclk_tip", &key)), egui::Sense::hover())
-                    .on_hover_text(tip);
+                if (p.x - gx).abs() > 0.5 {
+                    cv.wire(&[pos2(gx, p.y), *p], *active);
+                }
+                cv.dot(pos2(gx, p.y), *active);
             }
         }
 
-        painter.set(wire_slot, egui::Shape::Vec(wires));
-
-        painter.text(
-            pos2(canvas.left() + 20.0, canvas.bottom() - 14.0),
-            Align2::LEFT_BOTTOM,
-            format!(
-                "Clock tree discovered from stm32-data registers/rcc_{}.json · frequencies of internal RC oscillators are nominal · check the datasheet for maximum clock limits",
-                tree.rcc_version
-            ),
-            FontId::proportional(11.0),
-            theme::TEXT_DIM,
-        );
+        // ---- peripheral clock muxes, MCO, LSCO, other choices ----
+        let grid_top = sources_bottom.max(pll_bottom).max(core_bottom) + 50.0;
+        self.draw_mux_grid(cv, tree, grid_top)
     }
 
-    /// Draw one PLL group starting at `y`. Returns (height, output anchors, source-mux output).
-    #[allow(clippy::too_many_arguments)]
-    fn draw_pll(
-        ui: &mut egui::Ui,
-        painter: &egui::Painter,
-        wires: &mut Vec<egui::Shape>,
-        at: &dyn Fn(f32, f32, f32, f32) -> Rect,
-        y: f32,
-        pll: &PllDraw,
-        osc_out: &BTreeMap<String, Pos2>,
-        shared_src: Option<Pos2>,
-        edits: &mut Vec<Edit>,
-        main: bool,
-    ) -> (f32, Vec<(char, Pos2)>, Option<Pos2>) {
-        let on = pll.enabled;
-        let h = 44.0 + (pll.outs.len().max(1) as f32 * 82.0).max(110.0);
-        let group = at(PLL_X, y, PLL_W, h);
-        painter.rect(
-            group,
-            10.0,
-            Color32::from_rgba_unmultiplied(0x24, 0x28, 0x30, if on { 60 } else { 20 }),
-            Stroke::new(1.0, if on { theme::ACCENT_DIM } else { theme::BORDER }),
-            StrokeKind::Inside,
-        );
-        painter.text(group.left_top() + vec2(12.0, 10.0), Align2::LEFT_TOP, &pll.title, FontId::proportional(13.0), if on { theme::TEXT } else { theme::TEXT_DIM });
-        let mut en = on;
-        if ui
-            .put(Rect::from_min_size(group.right_top() + vec2(-110.0, 6.0), vec2(100.0, 22.0)), egui::Checkbox::new(&mut en, "Enable"))
-            .changed()
-        {
-            edits.push(if main { Edit::PllEnabled(en) } else { Edit::AuxEnabled(pll.name.clone(), en) });
-        }
-        let top = y + 40.0;
-        // The main PLL keeps its settings as roles (used by code generation); others by register field.
-        let set = |sel: &Selector, v: String, role: Option<Role>| match role.filter(|_| main) {
-            Some(role) => Edit::Role(role, v),
-            None => Edit::Value(sel.clone(), v),
-        };
+    /// One PLL frame at `y`. Returns (height, input point of its first box, output anchors).
+    fn draw_pll(&self, cv: &mut Cv, y: f32, d: &PllDraw) -> (f32, Pos2, Vec<(char, Pos2, bool)>) {
+        let on = d.enabled;
+        let h = (30.0 + d.outs.len().max(1) as f32 * 34.0 + 6.0).max(84.0);
+        cv.frame(PLL_X, y, PLL_W, h, on);
+        cv.text(pos2(PLL_X + 22.0, y + 5.0), Align2::LEFT_TOP, &d.title, 10.5, if on { theme::TEXT } else { OFF_TEXT });
+        let toggle = if d.main { Edit::PllEnabled(!on) } else { Edit::AuxEnabled(d.name.clone(), !on) };
+        cv.check(PLL_X + 8.0, y + 6.0, on, Action::Edit(toggle), "Enable this PLL");
+        let row = y + 38.0;
 
-        // Source mux
-        let mut prev: Option<Pos2> = shared_src;
-        let mut src_out = None;
-        if let Some((sel, cur)) = &pll.src {
-            let r = at(PLL_X + 12.0, top, 128.0, 74.0);
-            node(painter, r, "Source mux", on);
-            if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(r.left_top() + vec2(8.0, 28.0), vec2(112.0, 24.0)), sel, cur) {
-                edits.push(set(sel, v, Some(Role::PllSrc)));
-            }
-            for v in &sel.variants {
-                if let Some(from) = oscillator_base(&v.name).and_then(|b| osc_out.get(&b)) {
-                    wire(wires, *from, input(r), on && v.name == *cur);
-                }
-            }
-            prev = Some(output(r));
-            src_out = prev;
-        }
         // /M
-        if let Some((sel, cur)) = &pll.m {
-            let r = at(PLL_X + 152.0, top, 100.0, 74.0);
-            node(painter, r, "/M", on);
-            if let Some(p) = prev {
-                wire(wires, p, input(r), on);
-            }
-            if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(r.left_top() + vec2(8.0, 28.0), vec2(84.0, 24.0)), sel, cur) {
-                edits.push(set(sel, v, Some(Role::PllM)));
-            }
-            freq(painter, r, "in", pll.pll_in, on);
-            prev = Some(output(r));
+        let mut x = PLL_X + 12.0;
+        let m_in = pos2(x, row + BOX_H / 2.0);
+        let mut prev = None;
+        if let Some((sel, cur)) = &d.m {
+            cv.caption(x, row, "/M");
+            let target = if d.main { Target::Role(Role::PllM) } else { Target::Value };
+            let action = Action::Popup(PopupKind::Choose { sel: (*sel).clone(), target, current: cur.clone() });
+            prev = Some(cv.sbox(x, row, 48.0, &pretty(cur), on, Some(action), &sel.key()));
+            x += 66.0;
+        } else if let Some(shared) = &d.m_shared {
+            cv.caption(x, row, "/M (shared)");
+            prev = Some(cv.sbox(x, row, 48.0, shared, false, None, "Uses the main PLL's /M"));
+            x += 66.0;
         }
-        // ×N
-        let (nsel, ncur) = &pll.n;
-        let nr = at(PLL_X + 266.0, top, 120.0, 92.0);
-        node(painter, nr, "×N", on);
+        // *N
+        let (nsel, ncur) = &d.n;
         if let Some(p) = prev {
-            wire(wires, p, input(nr), on);
+            cv.wire(&[p, pos2(x, p.y)], on);
         }
-        if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(nr.left_top() + vec2(8.0, 28.0), vec2(104.0, 24.0)), nsel, ncur) {
-            edits.push(set(nsel, v, Some(Role::PllN)));
-        }
-        freq(painter, nr, "VCO", pll.vco, on);
-        let n_out = output(nr);
+        cv.caption(x, row, "*N");
+        let target = if d.main { Target::Role(Role::PllN) } else { Target::Value };
+        let action = Action::Popup(PopupKind::Choose { sel: (*nsel).clone(), target, current: ncur.clone() });
+        let n_out = cv.sbox(x, row, 56.0, &pretty(ncur), on, Some(action), &nsel.key());
+        cv.text(pos2(x, row + BOX_H + 3.0), Align2::LEFT_TOP, format!("in {}", format_hz(d.pll_in)), 8.5, LABEL);
+        cv.text(pos2(x, row + BOX_H + 14.0), Align2::LEFT_TOP, format!("VCO {}", format_hz(d.vco)), 8.5, if on { theme::ACCENT } else { LABEL });
 
-        // Outputs
+        // Outputs: /P /Q /R
+        let trunk = PLL_X + 150.0;
         let mut anchors = Vec::new();
-        for (i, (letter, sel, cur, active, f, role)) in pll.outs.iter().enumerate() {
-            let r = at(PLL_X + 400.0, top + i as f32 * 82.0, 188.0, 70.0);
-            let name = format!("{}_{letter}", pll.name);
-            node(painter, r, &format!("/{letter}  →  {name}"), *active);
-            wire(wires, n_out, input(r), *active);
-            let combo_w = if main { 112.0 } else { 172.0 };
-            if let Some(v) = Self::selector_combo(ui, Rect::from_min_size(r.left_top() + vec2(8.0, 26.0), vec2(combo_w, 24.0)), sel, cur) {
-                edits.push(set(sel, v, *role));
+        let mut last_y = n_out.y;
+        for (i, (letter, sel, cur, active, f, role)) in d.outs.iter().enumerate() {
+            let by = y + 36.0 + i as f32 * 34.0;
+            let cy = by + BOX_H / 2.0;
+            cv.wire(&[pos2(trunk, cy), pos2(trunk + 8.0, cy)], *active);
+            cv.dot(pos2(trunk, cy), *active);
+            last_y = last_y.max(cy);
+            cv.caption(trunk + 8.0, by, &format!("/{letter}"));
+            let target = match role {
+                Some(r) => Target::Role(*r),
+                None => Target::Value,
+            };
+            let action = Action::Popup(PopupKind::Choose { sel: (*sel).clone(), target, current: cur.clone() });
+            let p = cv.sbox(trunk + 8.0, by, 42.0, &pretty(cur), *active, Some(action), &sel.key());
+            cv.wire(&[p, pos2(PLL_X + 210.0, p.y)], *active);
+            let name = format!("{}_{letter}", d.name);
+            cv.caption(PLL_X + 210.0, by, &name);
+            let end = cv.vbox(PLL_X + 210.0, by, 72.0, f.unwrap_or(0.0), *active, None, &name);
+            if let (true, Some(role)) = (d.main, role) {
+                cv.check(PLL_X + PLL_W - 12.0, by - 11.0, *active, Action::Edit(Edit::PllOutput(*role, !*active)), "Enable this output (always on when it drives SYSCLK or a peripheral)");
             }
-            if let (true, Some(role)) = (main, role) {
-                let mut out_on = *active;
-                if ui
-                    .put(Rect::from_min_size(r.left_top() + vec2(128.0, 27.0), vec2(55.0, 22.0)), egui::Checkbox::new(&mut out_on, "on"))
-                    .on_hover_text("Enable this output (always on when it drives SYSCLK or a peripheral clock)")
-                    .changed()
-                {
-                    edits.push(Edit::PllOutput(*role, out_on));
-                }
-            }
-            freq(painter, r, "", f.unwrap_or(0.0), *active);
-            anchors.push((*letter, output(r)));
+            let out = pos2(PLL_X + PLL_W, end.y);
+            cv.wire(&[end, out], *active);
+            anchors.push((*letter, out, *active));
         }
+        cv.wire(&[n_out, pos2(trunk, n_out.y), pos2(trunk, last_y.max(n_out.y))], on);
         if anchors.is_empty() {
             // F0/F1 style: the multiplier output is the PLL clock.
-            anchors.push(('P', n_out));
+            let out = pos2(PLL_X + PLL_W, n_out.y);
+            cv.wire(&[n_out, out], on);
+            anchors.push(('P', out, on));
         }
-        (h, anchors, src_out)
+        (h, m_in, anchors)
+    }
+
+    /// Peripheral kernel muxes, clock outputs and other RCC choices, in a masonry grid.
+    fn draw_mux_grid(&self, cv: &mut Cv, tree: &ClockTree, top: f32) -> f32 {
+        let clk = &self.project.clock;
+        let res = &self.clocks;
+        cv.text(pos2(0.0, top - 22.0), Align2::LEFT_TOP, "PERIPHERAL CLOCK MUXES  ·  CLOCK OUTPUTS", 9.0, theme::TEXT_DIM);
+
+        // Peripheral users of every mux.
+        let mut users: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+        if let Some(chip) = &self.chip {
+            for p in chip.peripherals() {
+                if let Some(KernelClock::Mux(m)) = p.rcc.as_ref().and_then(|r| r.kernel_clock.as_ref()) {
+                    users
+                        .entry(format!("{}.{}", m.register, m.field))
+                        .or_default()
+                        .push((p.name.clone(), self.project.is_peripheral_enabled(&p.name)));
+                }
+            }
+        }
+
+        enum Block<'a> {
+            Mux { sel: &'a Selector, to: String, title: String, used: bool, pre: Option<&'a Selector>, hz: f64 },
+            Misc(&'a Selector),
+        }
+        let mut blocks: Vec<Block> = Vec::new();
+        for ((sel, pre), f) in tree.mcos.iter().zip(&res.mco) {
+            let pin = sel.field.trim_end_matches("SEL").to_string();
+            blocks.push(Block::Mux { sel, to: pin.clone(), title: format!("{pin} source Mux"), used: *f > 0.0, pre: pre.as_ref(), hz: *f });
+        }
+        for (key, sel) in tree.muxes.iter().filter(|(k, _)| k.ends_with(".LSCOSEL")) {
+            blocks.push(Block::Mux { sel, to: "To LSCO".into(), title: "LSCO Mux".into(), used: false, pre: None, hz: res.kernel.get(key).copied().unwrap_or(0.0) });
+        }
+        let mut kernel: Vec<(String, Block)> = tree
+            .muxes
+            .iter()
+            .filter(|(k, _)| !ClockTree::is_system_mux(k))
+            .map(|(key, sel)| {
+                let list = users.get(key).cloned().unwrap_or_default();
+                let names: Vec<&str> = list.iter().map(|(n, _)| n.as_str()).collect();
+                let to = if names.is_empty() {
+                    format!("To {}", sel.field.trim_end_matches("SEL"))
+                } else if names.join(", ").len() > 20 && names.len() > 1 {
+                    format!("To {} +{}", names[0], names.len() - 1)
+                } else {
+                    format!("To {}", names.join(", "))
+                };
+                let block = Block::Mux {
+                    sel,
+                    title: format!("{} Clock Mux", sel.field.trim_end_matches("SEL")),
+                    to: to.clone(),
+                    used: list.iter().any(|(_, e)| *e),
+                    pre: None,
+                    hz: res.kernel.get(key).copied().unwrap_or(0.0),
+                };
+                (to, block)
+            })
+            .collect();
+        kernel.sort_by(|a, b| a.0.cmp(&b.0));
+        blocks.extend(kernel.into_iter().map(|(_, b)| b));
+        blocks.extend(tree.misc.iter().map(Block::Misc));
+
+        let col_w = CANVAS_W / GRID_COLS as f32;
+        let mut heights = [top; GRID_COLS];
+        for block in blocks {
+            let col = (0..GRID_COLS).min_by(|a, b| heights[*a].total_cmp(&heights[*b])).unwrap_or(0);
+            let bx = col as f32 * col_w;
+            let by = heights[col];
+            let h = match block {
+                Block::Mux { sel, to, title, used, pre, hz } => {
+                    let cur = clk.value(sel).to_string();
+                    let inputs: Vec<MuxIn> = sel
+                        .variants
+                        .iter()
+                        .map(|v| MuxIn {
+                            label: input_label(&v.name),
+                            selected: v.name == cur,
+                            action: Action::Edit(Edit::Value(sel.clone(), v.name.clone())),
+                            tip: match res.resolve(&v.name) {
+                                Some(f) => format!("{} = {}  ({})", sel.key(), v.name, format_hz(f)),
+                                None => format!("{} = {}  (external clock)", sel.key(), v.name),
+                            },
+                        })
+                        .collect();
+                    let mx = bx + 96.0;
+                    cv.text(pos2(bx, by), Align2::LEFT_TOP, &title, 9.5, if used { theme::TEXT } else { LABEL });
+                    let active = hz > 0.0;
+                    let (attach, out, mb) = cv.mux(mx, by + 16.0, inputs, used || active);
+                    for (v, at) in sel.variants.iter().zip(&attach) {
+                        let selected = v.name == cur;
+                        cv.wire(&[pos2(bx + 30.0, at.y), *at], selected && active);
+                    }
+                    let mut p = out;
+                    if let Some(pre) = pre {
+                        let pcur = clk.value(pre).to_string();
+                        let action = Action::Popup(PopupKind::Choose { sel: pre.clone(), target: Target::Value, current: pcur.clone() });
+                        cv.wire(&[p, pos2(mx + 40.0, p.y)], active);
+                        p = cv.sbox(mx + 40.0, p.y - BOX_H / 2.0, 40.0, &pretty(&pcur), active, Some(action), &pre.key());
+                    }
+                    let vx = mx + if pre.is_some() { 90.0 } else { 44.0 };
+                    cv.wire(&[p, pos2(vx, p.y)], active);
+                    let known = res.resolve(&cur).is_some();
+                    let end = cv.vbox(vx, p.y - BOX_H / 2.0, 72.0, hz, active, None, &sel.key());
+                    cv.text(
+                        end + vec2(6.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        if known { to.as_str() } else { "external clock" },
+                        9.5,
+                        if used { theme::TEXT } else { LABEL },
+                    );
+                    mb - by + 18.0
+                }
+                Block::Misc(sel) => {
+                    let title = match sel.field.as_str() {
+                        "STOPWUCK" => "Wake-up clock from Stop",
+                        "STOPKERWUCK" => "Kernel wake-up from Stop",
+                        "TIMPRE" => "Timer clock prescaler",
+                        "LSIPREDIV" => "LSI prescaler",
+                        other => other,
+                    };
+                    cv.text(pos2(bx, by), Align2::LEFT_TOP, title, 9.5, LABEL);
+                    let cur = clk.value(sel).to_string();
+                    let action = Action::Popup(PopupKind::Choose { sel: sel.clone(), target: Target::Value, current: cur.clone() });
+                    cv.sbox(bx, by + 16.0, 110.0, &pretty(&cur), true, Some(action), &sel.key());
+                    50.0
+                }
+            };
+            heights[col] = by + h;
+        }
+        heights.iter().copied().fold(top, f32::max)
     }
 }

@@ -7,6 +7,7 @@ mod db;
 mod editor;
 mod hub;
 mod project;
+mod schematic;
 mod theme;
 
 fn main() -> eframe::Result {
@@ -22,6 +23,24 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         };
         match generate_headless(std::path::Path::new(dir)) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--import-schematic") {
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
+        }
+        let (Some(dir), Some(file)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: embassy-studio --import-schematic <project-dir> <schematic.svg|pdf|kicad_sch|SchDoc>");
+            std::process::exit(2);
+        };
+        match import_schematic_headless(std::path::Path::new(dir), std::path::Path::new(file)) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -51,6 +70,29 @@ fn main() -> eframe::Result {
             Ok(Box::new(app::App::new(cc.egui_ctx.clone(), open)))
         }),
     )
+}
+
+/// Import a schematic into a project and auto-locate the MCU pins, without the GUI.
+fn import_schematic_headless(dir: &std::path::Path, file: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let settings = project::Settings::load();
+    let mut project = project::Project::load(dir)?;
+    let chip = db::Chip::load(&settings.data_source, &project.chip, false)?;
+    let pkg = chip.package(&project.package).or(chip.packages.first()).context("the chip has no package data")?;
+    let pins = schematic::PinNames::from_package(pkg);
+    let drawings = schematic::import(file, &pins)?;
+    let source = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let done = schematic::add_to_project(&mut project.schematic, dir, &source, drawings, &pins)?;
+    for e in &done.errors {
+        eprintln!("could not write {e}");
+    }
+    project.save(dir)?;
+    for f in &done.files {
+        let nodes = project.schematic.sheets.iter().find(|s| &s.file == f).map(|s| s.nodes.len()).unwrap_or(0);
+        println!("{f}: {nodes} nodes");
+    }
+    println!("{} ({}): located {} of {} I/O pins", project.chip, pkg.name, done.gpios.len(), pins.gpios.len());
+    Ok(())
 }
 
 /// Regenerate a project's code without the GUI (for scripts and CI).

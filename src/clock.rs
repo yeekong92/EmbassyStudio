@@ -374,6 +374,9 @@ pub struct ClockConfig {
     /// Extra PLLs switched on, by name (`PLLSAI1`).
     #[serde(default)]
     pub aux_pll_enabled: BTreeMap<String, bool>,
+    /// Cortex SysTick fed by HCLK/8 instead of HCLK.
+    #[serde(default)]
+    pub systick_div8: bool,
 }
 
 /// Fields stored in `ClockConfig::muxes` (the rest go to `extra`), mirroring `ClockTree::from_rcc`.
@@ -382,7 +385,7 @@ fn is_mux_field(field: &str) -> bool {
 }
 
 /// Frequency named by an oscillator range variant: `Range4M` -> 4 MHz, `Range100K` -> 100 kHz.
-fn range_frequency(variant: &str) -> Option<f64> {
+pub fn range_frequency(variant: &str) -> Option<f64> {
     let upper = variant.to_ascii_uppercase();
     let start = upper.find(|c: char| c.is_ascii_digit())?;
     let rest = &upper[start..];
@@ -398,13 +401,22 @@ fn range_frequency(variant: &str) -> Option<f64> {
 
 /// Nominal oscillator frequency used to seed a new configuration.
 /// Users edit these to match their board / the datasheet.
-pub fn nominal_frequency(osc: &str) -> f64 {
+/// `rcc_version` is the stm32-data RCC version (`f1`, `l4plus`, `h7rm0433`, ...):
+/// the internal oscillators differ between families.
+pub fn nominal_frequency(osc: &str, rcc_version: &str) -> f64 {
+    let v = rcc_version.to_ascii_lowercase();
+    let old_f = ["f0", "f1", "f3"].iter().any(|f| v.starts_with(f));
     match osc {
         "HSE" => 8_000_000.0,
         "HSI48" => 48_000_000.0,
+        // HSI is 8 MHz on F0/F1/F3, 64 MHz before HSIDIV on H7/H5, 48 MHz on C0.
+        "HSI" if old_f => 8_000_000.0,
+        "HSI" if v.starts_with("h7") || v.starts_with("h5") => 64_000_000.0,
+        "HSI" if v.starts_with("c0") => 48_000_000.0,
         "HSI" => 16_000_000.0,
         "MSI" | "MSIS" | "MSIK" | "CSI" => 4_000_000.0,
         "LSE" => 32_768.0,
+        "LSI" if old_f => 40_000.0,
         "LSI" => 32_000.0,
         _ => 0.0,
     }
@@ -416,7 +428,7 @@ impl ClockConfig {
         for osc in &tree.oscillators {
             self.oscillators
                 .entry(osc.clone())
-                .or_insert_with(|| nominal_frequency(osc));
+                .or_insert_with(|| nominal_frequency(osc, &tree.rcc_version));
             let external = osc.starts_with("HSE") || osc.starts_with("LSE");
             self.enabled.entry(osc.clone()).or_insert(!external);
         }
@@ -450,7 +462,7 @@ impl ClockConfig {
             if self.extra.get(&sel.key()).is_some_and(|v| sel.has(v)) {
                 continue;
             }
-            let want = self.oscillators.get(osc).copied().unwrap_or_else(|| nominal_frequency(osc));
+            let want = self.oscillators.get(osc).copied().unwrap_or_else(|| nominal_frequency(osc, &tree.rcc_version));
             if let Some(v) = sel.variants.iter().find(|v| range_frequency(&v.name) == Some(want)) {
                 self.extra.insert(sel.key(), v.name.clone());
             }
@@ -819,5 +831,127 @@ mod tests {
         let r = c.compute(&t);
         assert_eq!(r.resolve("PCLK1"), Some(24e6));
         assert_eq!(r.resolve("PCLK1_TIM"), Some(48e6));
+    }
+
+    /// The STM32CubeMX reference tree for the L4R5 (120 MHz). Two values differ from
+    /// the written spec because the spec cannot add up otherwise:
+    /// - PLL source HSI (16 MHz), not MSI (4 MHz): 4/2*30/2 = 30 MHz, 16/2*30/2 = 120 MHz,
+    ///   and PLLSAI1/2 only reach 96/64 MHz from 16 MHz too (all PLLs share PLLSRC).
+    /// - PLLSAI1 /Q = /4: CLK48 = PLLSAI1_Q must be 48 MHz, and 192/2 would be 96 MHz.
+    pub(crate) fn cubemx_reference(t: &ClockTree) -> ClockConfig {
+        let mut c = ClockConfig::default();
+        c.normalize(t);
+        for osc in ["LSE", "LSI", "MSI", "HSI", "HSE"] {
+            c.enabled.insert(osc.into(), true);
+        }
+        c.oscillators.insert("HSE".into(), 8e6);
+        c.oscillators.insert("LSE".into(), 32_768.0);
+        c.oscillators.insert("LSI".into(), 32_000.0);
+        c.set_value(&t.osc_range["MSI"], "Range4M".into());
+        c.set_value(&t.muxes["BDCR.RTCSEL"], "LSE".into());
+        // Main PLL: /2 *30, P Q R /2.
+        c.pll_enabled = true;
+        for (role, v) in [
+            (Role::PllSrc, "HSI"),
+            (Role::PllM, "Div2"),
+            (Role::PllN, "Mul30"),
+            (Role::PllP, "Div2"),
+            (Role::PllQ, "Div2"),
+            (Role::PllR, "Div2"),
+            (Role::Sys, "PLL1_R"),
+            (Role::Ahb, "Div1"),
+        ] {
+            c.roles.insert(role, v.into());
+        }
+        c.pll_outputs.insert(Role::PllP, true);
+        c.pll_outputs.insert(Role::PllQ, true);
+        c.apb.insert("PPRE1".into(), "Div2".into());
+        c.apb.insert("PPRE2".into(), "Div1".into());
+        // PLLSAI1: /1 *12, P R /2, Q /4. PLLSAI2: /1 *8, P Q R /2.
+        for (name, n, q) in [("PLLSAI1", "Mul12", "Div4"), ("PLLSAI2", "Mul8", "Div2")] {
+            let pll = t.aux_plls.iter().find(|p| p.name == name).unwrap();
+            c.aux_pll_enabled.insert(name.into(), true);
+            c.set_value(pll.m.as_ref().unwrap(), "Div1".into());
+            c.set_value(&pll.n, n.into());
+            c.set_value(pll.p.as_ref().unwrap(), "Div2".into());
+            c.set_value(pll.q.as_ref().unwrap(), q.into());
+            c.set_value(pll.r.as_ref().unwrap(), "Div2".into());
+        }
+        for (mux, v) in [
+            ("CCIPR.CLK48SEL", "PLLSAI1_Q"),
+            ("CCIPR.ADCSEL", "PLLSAI1_R"),
+            ("CCIPR2.SAI1SEL", "PLLSAI1_P"),
+            ("CCIPR.I2C1SEL", "PCLK1"),
+            ("CCIPR.I2C2SEL", "PCLK1"),
+            ("CCIPR.I2C3SEL", "PCLK1"),
+            ("CCIPR.USART1SEL", "PCLK2"),
+            ("CCIPR.USART2SEL", "PCLK1"),
+            ("CCIPR.USART3SEL", "PCLK1"),
+            ("CCIPR.UART4SEL", "PCLK1"),
+            ("CCIPR.UART5SEL", "PCLK1"),
+            ("CCIPR.LPUART1SEL", "PCLK1"),
+            ("CCIPR.LPTIM1SEL", "PCLK1"),
+            ("CCIPR.LPTIM2SEL", "PCLK1"),
+        ] {
+            c.set_value(&t.muxes[mux], v.into());
+        }
+        c
+    }
+
+    #[test]
+    fn family_oscillator_defaults() {
+        for (version, hsi, lsi) in [("f1", 8e6, 40e3), ("f4", 16e6, 32e3), ("l4plus", 16e6, 32e3), ("h7rm0433", 64e6, 32e3)] {
+            let Some(t) = tree(version) else { continue };
+            let mut c = ClockConfig::default();
+            c.normalize(&t);
+            assert_eq!(c.osc_frequency(&t, "HSI"), hsi, "HSI of {version}");
+            assert_eq!(c.osc_frequency(&t, "LSI"), lsi, "LSI of {version}");
+        }
+    }
+
+    #[test]
+    fn l4plus_cubemx_reference_tree() {
+        let Some(t) = tree("l4plus") else { return };
+        let r = cubemx_reference(&t).compute(&t);
+        let mhz = |f: f64| (f / 1e6 * 1000.0).round() / 1000.0;
+        // Sources
+        assert_eq!(r.resolve("LSE"), Some(32_768.0));
+        assert_eq!(r.resolve("LSI"), Some(32_000.0));
+        assert_eq!(r.resolve("MSI"), Some(4e6));
+        assert_eq!(r.resolve("HSI"), Some(16e6));
+        assert_eq!(r.resolve("HSE"), Some(8e6));
+        assert_eq!(r.kernel["BDCR.RTCSEL"], 32_768.0, "RTC from LSE");
+        // PLLs
+        assert_eq!((mhz(r.pll_in), mhz(r.vco)), (8.0, 240.0));
+        assert_eq!((r.pll_p, r.pll_q, r.pll_r), (Some(120e6), Some(120e6), Some(120e6)));
+        let sai1 = &r.aux[0];
+        assert_eq!((sai1.vco, sai1.p, sai1.q, sai1.r), (192e6, Some(96e6), Some(48e6), Some(96e6)));
+        let sai2 = &r.aux[1];
+        assert_eq!((sai2.vco, sai2.p, sai2.q, sai2.r), (128e6, Some(64e6), Some(64e6), Some(64e6)));
+        // System and buses
+        assert_eq!((r.sysclk, r.hclk), (120e6, 120e6));
+        assert_eq!(r.resolve("PCLK1"), Some(60e6));
+        assert_eq!(r.resolve("PCLK1_TIM"), Some(120e6));
+        assert_eq!(r.resolve("PCLK2"), Some(120e6));
+        assert_eq!(r.resolve("PCLK2_TIM"), Some(120e6));
+        // Peripheral muxes
+        for (mux, hz) in [
+            ("CCIPR.CLK48SEL", 48e6),
+            ("CCIPR.ADCSEL", 96e6),
+            ("CCIPR2.SAI1SEL", 96e6),
+            ("CCIPR.I2C1SEL", 60e6),
+            ("CCIPR.I2C2SEL", 60e6),
+            ("CCIPR.I2C3SEL", 60e6),
+            ("CCIPR.USART1SEL", 120e6),
+            ("CCIPR.USART2SEL", 60e6),
+            ("CCIPR.USART3SEL", 60e6),
+            ("CCIPR.UART4SEL", 60e6),
+            ("CCIPR.UART5SEL", 60e6),
+            ("CCIPR.LPUART1SEL", 60e6),
+            ("CCIPR.LPTIM1SEL", 60e6),
+            ("CCIPR.LPTIM2SEL", 60e6),
+        ] {
+            assert_eq!(r.kernel[mux], hz, "{mux}");
+        }
     }
 }
