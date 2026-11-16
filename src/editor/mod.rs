@@ -1,6 +1,9 @@
 //! Main editor: pinout, schematic overlay, clock tree, peripherals and generated code preview.
 
 mod clock_view;
+mod esp_clock;
+#[cfg(test)]
+mod esp_tests;
 mod peripherals;
 mod pinout;
 mod schematic_view;
@@ -15,8 +18,9 @@ use egui::{Align, Layout, RichText};
 use crate::app::{Action, Data, Load};
 use crate::clock::{ClockResults, ClockTree, format_hz};
 use crate::codegen::{self, GenFile, RccFlavor};
-use crate::db::{Chip, PinFunction};
-use crate::project::{PinConfig, PinMode, Project, RecentProject};
+use crate::codegen_esp;
+use crate::db::{Chip, PinFunction, Platform};
+use crate::project::{PinConfig, PinMode, Project, RecentProject, Speed};
 use crate::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -205,7 +209,14 @@ impl Editor {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.centered_and_justified(|ui| match &self.load_error {
                     Some(e) => ui.label(RichText::new(format!("Could not load {}: {e}", self.project.chip)).color(theme::ERROR)),
-                    None => ui.label(format!("Loading {} from stm32-data…", self.project.chip)),
+                    None => ui.label(format!(
+                        "Loading {} from {}…",
+                        self.project.chip,
+                        match Platform::of(&self.project.chip) {
+                            Platform::Esp => "esp-hal metadata",
+                            Platform::Stm32 => "stm32-data",
+                        }
+                    )),
                 });
             });
             return;
@@ -251,6 +262,7 @@ impl Editor {
             .show(ui, |ui| match self.tab {
                 Tab::Pinout => self.pinout(ui, &chip),
                 Tab::Schematic => self.schematic_view(ui, &chip, actions),
+                Tab::Clock if chip.platform == Platform::Esp => self.esp_clock_view(ui, &chip),
                 Tab::Clock => self.clock_view(ui),
                 Tab::Code => self.code_view(ui, &chip),
             });
@@ -265,7 +277,12 @@ impl Editor {
                     ui.label(small(format!("{} · {}", self.project.chip, self.project.package)));
                     ui.label(small(self.dir.display().to_string()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if self.tree.is_some() {
+                        let esp = self.chip.as_ref().and_then(|c| c.esp.as_ref());
+                        if let Some(esp) = esp {
+                            if let Some(f) = codegen_esp::cpu_clock_mhz(&self.project, esp) {
+                                ui.label(small(format!("CPU {f} MHz")));
+                            }
+                        } else if self.tree.is_some() {
                             ui.label(small(format!(
                                 "SYSCLK {}  ·  HCLK {}",
                                 format_hz(self.clocks.sysclk),
@@ -308,7 +325,13 @@ impl Editor {
                     }
                 }
                 ui.add_space(10.0);
-                if let Some(tree) = &self.tree {
+                if chip.platform == Platform::Esp {
+                    ui.label(
+                        RichText::new(format!("esp-hal {}: CPU clock set in board::config().", crate::esp::ESP_HAL_TAG.trim_start_matches("esp-hal-v")))
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                } else if let Some(tree) = &self.tree {
                     let (txt, color) = match codegen::rcc_flavor(tree) {
                         RccFlavor::SummaryOnly => (
                             format!("RCC '{}': clock tree written as comments; set config.rcc by hand.", tree.rcc_version),
@@ -361,6 +384,10 @@ impl Editor {
                 let label = self.project.pins.get(pin).map(|c| c.label.clone()).unwrap_or_default();
                 let mut cfg = PinConfig::new(mode);
                 cfg.label = label;
+                // ESP32 outputs: start at esp-hal's default drive strength (20 mA).
+                if self.chip.as_ref().is_some_and(|c| c.platform == Platform::Esp) {
+                    cfg.speed = Speed::High;
+                }
                 self.project.pins.insert(pin.to_string(), cfg);
             }
         }

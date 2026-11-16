@@ -3,7 +3,7 @@ name = "embassy-studio"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Open-source STM32 project configurator and Embassy code generator"
+description = "Open-source STM32 and ESP32 project configurator and Embassy code generator"
 repository = "https://github.com/embassy-rs/stm32-data"
 
 [[bin]]
@@ -23,6 +23,8 @@ anyhow = "1"
 resvg = "0.50"
 hayro-svg = "0.9"
 cfb = "0.16"
+# esp-hal's esp-metadata device files use TOML 1.1 (multi-line inline tables).
+toml = "1"
 
 [target.'cfg(windows)'.dependencies]
 # AttachConsole, so `--generate` can print from the GUI-subsystem release build.

@@ -1,5 +1,8 @@
 //! Code generation: turns a project into a ready-to-build Embassy firmware crate.
 //!
+//! This module generates STM32 (embassy-stm32) crates; ESP32 chips are handed to
+//! [`crate::codegen_esp`], which produces the same layout on esp-hal.
+//!
 //! Generated layout:
 //! - `Cargo.toml`, `build.rs`, `.cargo/config.toml`, `rust-toolchain.toml` — build setup
 //!   (Cargo.toml keeps everything below the user-section marker on regeneration)
@@ -100,6 +103,9 @@ fn pac_variant(v: &str) -> String {
 }
 
 pub fn generate(project: &Project, chip: &Chip, tree: Option<&ClockTree>) -> Vec<GenFile> {
+    if chip.platform == crate::db::Platform::Esp {
+        return crate::codegen_esp::generate(project, chip);
+    }
     let triple = target_triple(chip.core_name());
     let pkg = crate_name(&project.name);
     let mut files = vec![
@@ -295,7 +301,7 @@ async fn main(_spawner: Spawner) {{
 }
 
 /// Rust field name for a pin: its user label, or the pin name.
-fn field_name(pin: &str, label: &str) -> String {
+pub(crate) fn field_name(pin: &str, label: &str) -> String {
     if label.trim().is_empty() {
         ident(pin)
     } else {

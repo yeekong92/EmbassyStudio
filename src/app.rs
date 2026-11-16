@@ -24,7 +24,7 @@ enum Msg {
     Registers(String, Result<Arc<RegisterFile>, String>),
 }
 
-/// Shared access to the stm32-data database, loading in background threads.
+/// Shared access to the chip databases (stm32-data, esp-hal metadata), loading in background threads.
 pub struct Data {
     pub source: DataSource,
     pub index: Option<ChipIndex>,
@@ -51,7 +51,8 @@ impl Data {
             rx,
             ctx,
         };
-        if data.index.is_none() {
+        // Indexes cached before ESP32 support have no ESP32 chips: sync once to add them.
+        if data.index.as_ref().is_none_or(|i| i.esp_source.is_none()) {
             data.sync_index();
         }
         data

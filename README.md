@@ -1,11 +1,19 @@
 # Embassy Studio
 
 An open-source desktop alternative to STM32CubeMX for [Embassy](https://embassy.dev) firmware,
-written in Rust ([egui](https://github.com/emilk/egui)). It ships as a single Windows `.exe`.
+written in Rust ([egui](https://github.com/emilk/egui)). It ships as a single Windows `.exe` and
+generates projects for **STM32** (embassy-stm32) and **ESP32** (esp-hal + esp-rtos) chips.
 
-All chip knowledge comes from [`embassy-rs/stm32-data`](https://github.com/embassy-rs/stm32-data):
-the chip list, packages and pin positions, alternate functions, peripherals, interrupts and the RCC
-register layout that the clock tree is built from. Nothing chip-specific is hardcoded.
+Nothing chip-specific is hardcoded:
+
+- **STM32** knowledge comes from [`embassy-rs/stm32-data`](https://github.com/embassy-rs/stm32-data):
+  the chip list, packages and pin positions, alternate functions, peripherals, interrupts and the
+  RCC register layout that the clock tree is built from.
+- **ESP32** knowledge comes from esp-hal's
+  [`esp-metadata`](https://github.com/esp-rs/esp-hal/tree/main/esp-metadata) device files, read at
+  the esp-hal release the generated code uses: GPIOs and their IO MUX / analog functions, pin
+  restrictions (strapping, flash, input-only), driver instances and their GPIO-matrix signals,
+  the Rust target and esp-hal's CPU clock presets. See [ESP32 support](#esp32-support).
 
 ## Features
 
@@ -25,15 +33,42 @@ register layout that the clock tree is built from. Nothing chip-specific is hard
 - **Peripherals**: enable/disable hardware blocks grouped by kind, route each signal to a pin, set
   baud rate / SPI and I²C frequency, see bus clock, IRQs and DMA requests.
 - **Code generation** straight into the project folder: an Embassy crate with `Cargo.toml`,
-  `build.rs`, `.cargo/config.toml` (probe-rs runner), `rust-toolchain.toml`, `src/board.rs`
-  (clocks, GPIO, EXTI, UART, SPI, I²C drivers) and a `src/main.rs` that is yours to edit.
-  `.vscode/` gets rust-analyzer, probe-rs debug and build task settings.
+  `build.rs`, `.cargo/config.toml` (probe-rs runner for STM32, espflash for ESP32),
+  `rust-toolchain.toml`, `src/board.rs` (clocks, GPIO, EXTI, UART, SPI, I²C drivers) and a
+  `src/main.rs` that is yours to edit. `.vscode/` gets rust-analyzer, probe-rs debug and build
+  task settings.
 
 ### Clock code support
 
 The clock tree is shown for every family. `board.rs` gets real `config.rcc` code for the F2/F4/F7
 and G4 RCC flavours; for other families the chosen tree is written as comments next to
 `Config::default()`, so the project still builds and you can fill in `config.rcc` by hand.
+
+## ESP32 support
+
+ESP32, -C2, -C3, -C5, -C6, -C61, -H2, -P4, -S2, -S3 and -S31 are listed in the MCU selector
+(filter *ESP32*) next to the STM32 parts. They use the same editor:
+
+- **Pinout** shows every GPIO of the chip. ESP32 parts route peripheral signals through a GPIO
+  matrix, so any signal can go to any pin that can drive it (outputs are not offered on input-only
+  pins); the pin's IO MUX and ADC functions are listed with it. Pins wired to flash or PSRAM on most
+  modules are drawn as system pins, and the inspector warns about strapping pins. The metadata has
+  no package pinouts, so the drawing is a GPIO overview, not the physical package.
+- **Peripherals**: UART, SPI master, I²C master, I²S, TWAI, LEDC, RMT and ADC instances from the
+  metadata. UART (baud rate), SPI (SCK frequency) and I²C (bus frequency) get async drivers in
+  `board.rs`; the others are listed in `board::init` with the module to build them from.
+- **Clock Configuration**: esp-hal sets up the clock tree from one `CpuClock` preset; pick one of
+  the chip's presets (the maximum by default).
+- **Code**: an [esp-generate](https://github.com/esp-rs/esp-generate)-style crate on esp-hal 1.2,
+  esp-rtos (Embassy executor and time driver), esp-bootloader-esp-idf, esp-println and
+  esp-backtrace, with `log` or `defmt` logging. `cargo run --release` flashes with
+  [espflash](https://github.com/esp-rs/espflash) and opens the monitor. RISC-V chips build on stable
+  Rust; Xtensa chips (ESP32, -S2, -S3) need the `esp` toolchain from
+  [espup](https://github.com/esp-rs/espup).
+
+ESP32 data is fetched from `github.com/esp-rs/esp-hal` at the pinned release tag and cached in
+`%LOCALAPPDATA%\EmbassyStudio\esp-metadata`. Schematic import also recognises `IO4`-style pin
+labels as `GPIO4`.
 
 ## Schematic overlay
 
@@ -73,7 +108,7 @@ interpreted and nothing is checked against the schematic.
 
 By default chip files are fetched on demand from `github.com/embassy-rs/stm32-data-generated` and
 cached in `%LOCALAPPDATA%\EmbassyStudio\stm32-data`, so the app works offline after first use.
-*Sync database* refreshes the chip list. *Data source → Local stm32-data folder…* points at a local
+*Sync database* refreshes the chip list (STM32 and ESP32). *Data source → Local stm32-data folder…* points at a local
 clone of `stm32-data-generated` (or an `stm32-data` checkout with `build/data`).
 
 ## Building
@@ -108,4 +143,6 @@ embassy-studio --import-schematic <dir> <file>   # import a schematic and auto-l
 | `src/board.rs` | always |
 | `Cargo.toml` | yes, except the user section at the bottom |
 | `build.rs`, `.cargo/config.toml`, `rust-toolchain.toml`, `.vscode/*.json` | yes |
+
+The layout is the same for both platforms; only the dependencies, runner and toolchain differ.
 | `src/main.rs`, `README.md`, `.gitignore` | created once, then yours |

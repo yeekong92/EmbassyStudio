@@ -5,7 +5,7 @@ use std::f32::consts::FRAC_PI_2;
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 use super::Editor;
-use crate::db::{Chip, Package, gpio_name};
+use crate::db::{Chip, Package, Platform, gpio_name};
 use crate::project::{PinMode, Pull, Speed};
 use crate::theme;
 
@@ -221,6 +221,8 @@ impl Editor {
                 _ if conflicts.contains(g) => theme::PIN_CONFLICT,
                 Some(c) if matches!(c.mode, PinMode::Peripheral { .. }) => theme::PIN_PERIPH,
                 Some(_) => theme::PIN_GPIO,
+                // ESP32 pins wired to flash / PSRAM on most modules.
+                None if self.chip.as_ref().and_then(|c| c.esp.as_ref()).is_some_and(|e| e.reserved(g)) => theme::PIN_SPECIAL,
                 None => theme::PIN_FREE,
             },
             _ => theme::PIN_FREE,
@@ -242,7 +244,11 @@ impl Editor {
             ui.add_space(8.0);
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.pin_search)
-                    .hint_text("🔍 Find pin or peripheral (PA5, I2C1, LED)  Ctrl+F")
+                    .hint_text(if chip.platform == Platform::Esp {
+                        "🔍 Find pin or peripheral (GPIO5, UART1, LED)  Ctrl+F"
+                    } else {
+                        "🔍 Find pin or peripheral (PA5, I2C1, LED)  Ctrl+F"
+                    })
                     .desired_width(400.0),
             );
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
@@ -550,12 +556,30 @@ impl Editor {
             out = Some(None);
         }
         let line: String = gpio.chars().skip(2).collect();
-        for (mode, text) in [
-            (PinMode::GpioInput, "GPIO_Input".to_string()),
-            (PinMode::GpioOutput, "GPIO_Output".to_string()),
-            (PinMode::Analog, "GPIO_Analog".to_string()),
-            (PinMode::ExtiInput, format!("GPIO_EXTI{line}")),
-        ] {
+        let esp = self.chip.as_ref().and_then(|c| c.esp.as_ref());
+        let mut modes = vec![(PinMode::GpioInput, "GPIO_Input".to_string())];
+        match esp {
+            // ESP32: every input can await edges (no EXTI lines); analog only where an ADC channel is.
+            Some(esp) => {
+                if !esp.input_only(gpio) {
+                    modes.push((PinMode::GpioOutput, "GPIO_Output".to_string()));
+                }
+                let analog = self.chip.as_ref().and_then(|c| c.packages.first()).is_some_and(|pkg| {
+                    pkg.pins
+                        .iter()
+                        .any(|p| p.signals.first().map(String::as_str) == Some(gpio) && p.signals.iter().any(|s| s.starts_with("ADC")))
+                });
+                if analog {
+                    modes.push((PinMode::Analog, "GPIO_Analog".to_string()));
+                }
+            }
+            None => modes.extend([
+                (PinMode::GpioOutput, "GPIO_Output".to_string()),
+                (PinMode::Analog, "GPIO_Analog".to_string()),
+                (PinMode::ExtiInput, format!("GPIO_EXTI{line}")),
+            ]),
+        }
+        for (mode, text) in modes {
             if ui.selectable_label(current == Some(&mode), text).clicked() {
                 out = Some(Some(mode));
             }
@@ -606,6 +630,10 @@ impl Editor {
                     ui.end_row();
                 });
                 if let Some(g) = gpio {
+                    let limits = chip.esp.as_ref().and_then(|e| e.pin_limits.get(&g)).cloned().unwrap_or_default();
+                    for l in limits {
+                        ui.label(RichText::new(format!("⚠ {}", crate::esp::describe_limit(&l))).size(12.0).color(theme::WARN));
+                    }
                     ui.add_space(8.0);
                     self.gpio_settings(ui, &g);
                 } else {
@@ -670,12 +698,23 @@ impl Editor {
                         ui.radio_value(&mut cfg.initial_high, true, "High");
                     });
                     ui.end_row();
-                    ui.label(RichText::new("Speed").color(theme::TEXT_DIM));
+                    // ESP32 outputs have a drive strength instead of a slew-rate speed.
+                    let esp = self.chip.as_ref().is_some_and(|c| c.platform == Platform::Esp);
+                    let name = |s: Speed| -> String {
+                        match (esp, s) {
+                            (true, Speed::Low) => "5 mA".into(),
+                            (true, Speed::Medium) => "10 mA".into(),
+                            (true, Speed::High) => "20 mA".into(),
+                            (true, Speed::VeryHigh) => "40 mA".into(),
+                            (false, s) => format!("{s:?}"),
+                        }
+                    };
+                    ui.label(RichText::new(if esp { "Drive strength" } else { "Speed" }).color(theme::TEXT_DIM));
                     egui::ComboBox::from_id_salt(("speed", gpio))
-                        .selected_text(format!("{:?}", cfg.speed))
+                        .selected_text(name(cfg.speed))
                         .show_ui(ui, |ui| {
                             for s in [Speed::Low, Speed::Medium, Speed::High, Speed::VeryHigh] {
-                                ui.selectable_value(&mut cfg.speed, s, format!("{s:?}"));
+                                ui.selectable_value(&mut cfg.speed, s, name(s));
                             }
                         });
                     ui.end_row();

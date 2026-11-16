@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use egui::{Align, Layout, RichText, Sense};
 
 use crate::app::{Action, Data, Load};
-use crate::db::{DataSource, family_of};
+use crate::db::{DataSource, Platform, family_of};
 use crate::project::{Project, Settings};
 use crate::theme;
 
@@ -20,6 +20,8 @@ pub struct Hub {
     error: Option<String>,
     /// Put the keyboard focus in the project name box.
     focus_name: bool,
+    /// MCU selector: only chips of this platform (`None` = all).
+    platform: Option<Platform>,
 }
 
 impl Hub {
@@ -66,7 +68,7 @@ impl Hub {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Embassy Studio").size(22.0).strong().color(theme::TEXT));
                 ui.label(
-                    RichText::new("Open-source STM32 configurator & Embassy code generator")
+                    RichText::new("Open-source STM32 & ESP32 configurator and Embassy code generator")
                         .size(12.0)
                         .color(theme::TEXT_DIM),
                 );
@@ -93,11 +95,16 @@ impl Hub {
                 }
                 ui.add_space(8.0);
                 let status = if data.index_loading {
-                    RichText::new("Syncing stm32-data…").color(theme::WARN)
+                    RichText::new("Syncing chip databases…").color(theme::WARN)
                 } else if let Some(e) = &data.index_error {
                     RichText::new(format!("Database error: {e}")).color(theme::ERROR)
                 } else if let Some(i) = &data.index {
-                    RichText::new(format!("{} chips · {}", i.chips.len(), i.source)).color(theme::TEXT_DIM)
+                    let esp = i.chips.iter().filter(|c| Platform::of(c) == Platform::Esp).count();
+                    let text = match &i.esp_source {
+                        Some(e) => format!("{} STM32 · {} · {esp} ESP32 · {e}", i.chips.len() - esp, i.source),
+                        None => format!("{} chips · {}", i.chips.len(), i.source),
+                    };
+                    RichText::new(text).color(theme::TEXT_DIM)
                 } else {
                     RichText::new("No database").color(theme::WARN)
                 };
@@ -289,7 +296,7 @@ impl Hub {
                 if data.index_loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Loading chip list from stm32-data…");
+                        ui.label("Loading chip list…");
                     });
                 } else {
                     ui.label(RichText::new("Chip database unavailable. Use “Sync database” above.").color(theme::WARN));
@@ -305,16 +312,22 @@ impl Hub {
                     ui.set_width(ui.available_width().min(560.0));
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("🔍 Search, e.g. F411, G431CB, H743")
+                            .hint_text("🔍 Search, e.g. F411, G431CB, ESP32C3, S3")
                             .desired_width(f32::INFINITY),
                     );
                     if just_opened {
                         search.request_focus();
                     }
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.platform, None, "All");
+                        ui.selectable_value(&mut self.platform, Some(Platform::Stm32), Platform::Stm32.title());
+                        ui.selectable_value(&mut self.platform, Some(Platform::Esp), Platform::Esp.title());
+                    });
                     let tokens: Vec<String> = self.search.split_whitespace().map(|t| t.to_ascii_uppercase()).collect();
                     let matches: Vec<&String> = index
                         .chips
                         .iter()
+                        .filter(|c| self.platform.is_none_or(|p| Platform::of(c) == p))
                         .filter(|c| tokens.iter().all(|t| c.contains(t.as_str())))
                         .collect();
                     ui.label(RichText::new(format!("{} of {} chips", matches.len(), index.chips.len())).size(11.0).color(theme::TEXT_DIM));
@@ -354,7 +367,10 @@ impl Hub {
             Load::Loading => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!("Loading {name} from stm32-data…"));
+                    ui.label(format!(
+                        "Loading {name} from {}…",
+                        if Platform::of(name) == Platform::Esp { "esp-hal metadata" } else { "stm32-data" }
+                    ));
                 });
             }
             Load::Failed(e) => {
@@ -378,12 +394,25 @@ impl Hub {
                             kv(ui, "Family", chip.family.clone());
                             kv(ui, "Line", chip.line.clone());
                             ui.end_row();
-                            kv(ui, "Core", chip.cores.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(" + "));
-                            kv(ui, "Peripherals", chip.peripherals().len().to_string());
-                            ui.end_row();
-                            kv(ui, "Flash", format_size(chip.flash_size()));
-                            kv(ui, "RAM", format_size(chip.ram_size()));
-                            ui.end_row();
+                            if let Some(esp) = &chip.esp {
+                                kv(ui, "Target", esp.target.clone());
+                                kv(ui, "Peripherals", chip.peripherals().len().to_string());
+                                ui.end_row();
+                                let cpu = esp.max_cpu_clock_mhz().map(|f| format!("{f} MHz")).unwrap_or_else(|| "-".into());
+                                kv(ui, "CPU", cpu);
+                                kv(ui, "SRAM", format_size(chip.ram_size()));
+                                ui.end_row();
+                                kv(ui, "GPIOs", chip.packages.first().map(|p| p.pins.len()).unwrap_or(0).to_string());
+                                kv(ui, "Flash", "external (module)".into());
+                                ui.end_row();
+                            } else {
+                                kv(ui, "Core", chip.cores.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(" + "));
+                                kv(ui, "Peripherals", chip.peripherals().len().to_string());
+                                ui.end_row();
+                                kv(ui, "Flash", format_size(chip.flash_size()));
+                                kv(ui, "RAM", format_size(chip.ram_size()));
+                                ui.end_row();
+                            }
                         });
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {

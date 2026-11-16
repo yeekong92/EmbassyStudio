@@ -23,12 +23,16 @@ pub fn now_unix() -> u64 {
 pub struct Project {
     pub format_version: u32,
     pub name: String,
-    /// Chip name as in stm32-data, e.g. `STM32F411CE`.
+    /// Chip name as in the chip index, e.g. `STM32F411CE` (stm32-data) or `ESP32C3` (esp-metadata).
     pub chip: String,
-    /// Package (ordering code) name, e.g. `STM32F411CEUx`.
+    /// Package (ordering code) name, e.g. `STM32F411CEUx`. ESP32 chips have one synthetic
+    /// package holding every GPIO.
     pub package: String,
     #[serde(default)]
     pub clock: ClockConfig,
+    /// ESP32: CPU clock in MHz (one of esp-hal's `CpuClock` presets); `None` = the maximum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_clock_mhz: Option<u32>,
     /// Pin configuration keyed by GPIO name (`PA5`).
     #[serde(default)]
     pub pins: BTreeMap<String, PinConfig>,
@@ -149,6 +153,7 @@ impl Project {
             chip: chip.to_string(),
             package: package.to_string(),
             clock: ClockConfig::default(),
+            cpu_clock_mhz: None,
             pins: BTreeMap::new(),
             peripherals: BTreeMap::new(),
             codegen: CodegenOptions::default(),

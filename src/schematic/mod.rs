@@ -273,6 +273,8 @@ pub fn add_to_project(config: &mut SchematicConfig, project_dir: &Path, source: 
 #[derive(Clone, Debug, Default)]
 pub struct PinNames {
     pub gpios: BTreeSet<String>,
+    /// Other spellings of GPIO names: `IO4` -> `GPIO4` (ESP32 module schematics).
+    pub aliases: BTreeMap<String, String>,
     /// Power and system pins: normalised name -> (name as in stm32-data, pin count).
     pub passive: BTreeMap<String, (String, usize)>,
 }
@@ -290,6 +292,9 @@ impl PinNames {
         let mut out = Self::default();
         for p in &pkg.pins {
             if let Some(g) = p.signals.iter().find_map(|s| gpio_name(s)) {
+                if let Some(n) = g.strip_prefix("GPIO") {
+                    out.aliases.insert(format!("IO{n}"), g.clone());
+                }
                 out.gpios.insert(g);
             } else if let Some(s) = p.signals.first() {
                 out.passive.entry(normalize(s)).or_insert_with(|| (s.clone(), 0)).1 += 1;
@@ -333,9 +338,9 @@ impl PinNames {
             }
             let token: String = chars[start..i].iter().map(|c| c.to_ascii_uppercase()).collect();
             let is_first = std::mem::take(&mut first);
-            if !self.gpios.contains(&token) {
+            let Some(pin) = (if self.gpios.contains(&token) { Some(token.clone()) } else { self.aliases.get(&token).cloned() }) else {
                 continue;
-            }
+            };
             // 0: the text is exactly the pin name. 1: it starts with it (`PC14-OSC32_IN`).
             // 2: the name is buried in a longer string.
             let rank = if whole.eq_ignore_ascii_case(&token) {
@@ -354,7 +359,7 @@ impl PinNames {
                 c.y += item.dir.1 * mid * item.len;
                 c.len = item.len * k / total;
             }
-            out.push((token, c));
+            out.push((pin, c));
         }
         out
     }

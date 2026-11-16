@@ -1,9 +1,10 @@
-//! Access to the `embassy-rs/stm32-data` database.
+//! Chip database access.
 //!
-//! Nothing about chips is hardcoded: chip lists, pinouts, peripherals and RCC
-//! register layouts all come from the generated JSON published by the
-//! stm32-data project (`embassy-rs/stm32-data-generated`), or from a local
-//! checkout of it. Downloaded files are cached on disk so the app works offline
+//! Nothing about chips is hardcoded. STM32 chip lists, pinouts, peripherals and RCC
+//! register layouts come from the generated JSON published by the stm32-data project
+//! (`embassy-rs/stm32-data-generated`), or from a local checkout of it. ESP32 chips come
+//! from esp-hal's `esp-metadata` device files (see [`crate::esp`]) and are converted to
+//! the same [`Chip`] model. Downloaded files are cached on disk so the app works offline
 //! after the first sync.
 
 use std::collections::BTreeMap;
@@ -64,7 +65,7 @@ fn cache_dir() -> PathBuf {
     app_dir().join("stm32-data")
 }
 
-fn http_get(url: &str) -> Result<String> {
+pub(crate) fn http_get(url: &str) -> Result<String> {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     let agent = AGENT.get_or_init(|| {
@@ -125,6 +126,10 @@ pub struct ChipIndex {
     pub source: String,
     pub fetched_unix: u64,
     pub chips: Vec<String>,
+    /// Where the ESP32 part of `chips` came from; `None` for an index written before
+    /// ESP32 support (or when the esp-hal metadata could not be reached).
+    #[serde(default)]
+    pub esp_source: Option<String>,
 }
 
 impl ChipIndex {
@@ -178,13 +183,32 @@ impl ChipIndex {
                     .collect()
             }
         };
+        // ESP32 chips are listed from esp-hal's metadata. Without network access the
+        // STM32 list still loads; the ESP32 part falls back to the previous index.
+        let esp_source = match crate::esp::list_chips() {
+            Ok(esp) => {
+                chips.extend(esp);
+                Some(crate::esp::describe_source())
+            }
+            Err(_) => {
+                let old = Self::load_cached().filter(|i| i.esp_source.is_some());
+                let cached: Vec<String> = old
+                    .as_ref()
+                    .map(|i| i.chips.iter().filter(|c| Platform::of(c) == Platform::Esp).cloned().collect())
+                    .unwrap_or_default();
+                chips.extend(cached);
+                old.and_then(|i| i.esp_source)
+            }
+        };
         chips.sort();
+        chips.dedup();
         let index = Self {
             source: source.describe(),
             fetched_unix: crate::project::now_unix(),
             chips,
+            esp_source,
         };
-        if *source == DataSource::GitHub {
+        if *source == DataSource::GitHub || index.esp_source.is_some() {
             std::fs::create_dir_all(cache_dir()).ok();
             std::fs::write(Self::cache_path(), serde_json::to_string(&index)?).ok();
         }
@@ -192,15 +216,42 @@ impl ChipIndex {
     }
 }
 
-/// The family prefix of a chip name, e.g. `STM32F411CE` -> `STM32F4`.
-pub fn family_of(chip: &str) -> &str {
+/// Chip vendor / code generation target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Platform {
+    /// STM32 (stm32-data, embassy-stm32).
+    #[default]
+    Stm32,
+    /// Espressif ESP32 family (esp-metadata, esp-hal).
+    Esp,
+}
+
+impl Platform {
+    /// Platform of a chip name as it appears in the chip index.
+    pub fn of(chip: &str) -> Self {
+        if chip.to_ascii_uppercase().starts_with("ESP") { Self::Esp } else { Self::Stm32 }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Stm32 => "STM32",
+            Self::Esp => "ESP32",
+        }
+    }
+}
+
+/// The family prefix of a chip name, e.g. `STM32F411CE` -> `STM32F4`, `ESP32C3` -> `ESP32-C3`.
+pub fn family_of(chip: &str) -> std::borrow::Cow<'_, str> {
+    if Platform::of(chip) == Platform::Esp {
+        return crate::esp::display_name(chip).into();
+    }
     let end = chip
         .char_indices()
         .skip(5)
         .find(|(_, c)| c.is_ascii_digit())
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(chip.len());
-    &chip[..end.min(chip.len())]
+    chip[..end.min(chip.len())].into()
 }
 
 // ---------------------------------------------------------------------------
@@ -217,11 +268,17 @@ pub struct Chip {
     #[serde(default)]
     pub packages: Vec<Package>,
     #[serde(default)]
-    memory: Value,
+    pub(crate) memory: Value,
     #[serde(default)]
     pub docs: Vec<Doc>,
     #[serde(default)]
     pub cores: Vec<Core>,
+    /// Not part of the stm32-data schema: set by the loader.
+    #[serde(skip)]
+    pub platform: Platform,
+    /// ESP32-only details (target, CPU clocks, pin restrictions).
+    #[serde(skip)]
+    pub esp: Option<crate::esp::EspChip>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -317,6 +374,9 @@ pub struct PeriphInterrupt {
 
 impl Chip {
     pub fn load(source: &DataSource, name: &str, refresh: bool) -> Result<Self> {
+        if Platform::of(name) == Platform::Esp {
+            return crate::esp::load_chip(name, refresh);
+        }
         let text = read_data_file(source, &format!("chips/{name}.json"), refresh)?;
         serde_json::from_str(&text).with_context(|| format!("parsing chip {name}"))
     }
@@ -413,11 +473,15 @@ impl PinFunction {
 }
 
 /// Normalise a package signal name to a GPIO pin name, e.g. `PC14-OSC32_IN` -> `PC14`.
+/// ESP32 pins are named `GPIO<n>` (as in esp-hal's `Peripherals`).
 pub fn gpio_name(signal: &str) -> Option<String> {
     let s: String = signal
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric())
         .collect();
+    if let Some(n) = s.strip_prefix("GPIO") {
+        return (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then_some(s);
+    }
     let mut chars = s.chars();
     let is_gpio = chars.next() == Some('P')
         && chars.next().is_some_and(|c| c.is_ascii_uppercase())

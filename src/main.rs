@@ -3,8 +3,10 @@
 mod app;
 mod clock;
 mod codegen;
+mod codegen_esp;
 mod db;
 mod editor;
+mod esp;
 mod hub;
 mod project;
 mod schematic;
@@ -110,7 +112,10 @@ fn generate_headless(dir: &std::path::Path) -> anyhow::Result<()> {
         }
         None => None,
     };
-    if let Some(t) = &tree {
+    if let Some(esp) = &chip.esp {
+        let cpu = codegen_esp::cpu_clock_mhz(&project, esp).map(|f| format!("{f} MHz")).unwrap_or_else(|| "default".into());
+        println!("{}: CPU {cpu} ({}, esp-hal metadata {})", project.chip, esp.target, esp::ESP_HAL_TAG);
+    } else if let Some(t) = &tree {
         let r = project.clock.compute(t);
         println!(
             "{}: SYSCLK {}, HCLK {} (rcc {})",

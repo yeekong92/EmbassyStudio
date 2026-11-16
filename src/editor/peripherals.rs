@@ -58,8 +58,8 @@ impl Category {
             "dma" | "bdma" | "gpdma" | "lpdma" | "hpdma" | "mdma" | "dmamux" | "iwdg" | "wwdg" | "crs" | "icache" | "dcache"
             | "hsem" | "ipcc" => Self::SystemCore,
             "adc" | "dac" | "comp" | "opamp" | "vrefbuf" | "sdadc" | "dfsdm" | "mdf" | "adf" | "dts" => Self::Analog,
-            "timer" | "tim" | "lptim" | "rtc" | "hrtim" => Self::Timers,
-            "usart" | "lpuart" | "uart" | "spi" | "i2s" | "i2c" | "i3c" | "can" | "fdcan" | "usb" | "otg" | "usbram" | "eth"
+            "timer" | "tim" | "lptim" | "rtc" | "hrtim" | "ledc" | "mcpwm" | "pcnt" | "rmt" => Self::Timers,
+            "usart" | "lpuart" | "uart" | "spi" | "i2s" | "i2c" | "i3c" | "can" | "fdcan" | "twai" | "usb" | "otg" | "usbram" | "eth"
             | "sdmmc" | "octospi" | "quadspi" | "xspi" | "hspi" | "fmc" | "fsmc" | "swpmi" | "ucpd" | "mdios" | "cec" => {
                 Self::Connectivity
             }
@@ -182,17 +182,18 @@ impl Editor {
     /// Software components the generated project is built on.
     fn middleware_rows(&mut self, ui: &mut egui::Ui) {
         let dim = |t: &str| RichText::new(t).size(11.0).color(theme::TEXT_DIM);
+        let esp = self.chip.as_ref().is_some_and(|c| c.esp.is_some());
         ui.horizontal(|ui| {
             if ui.checkbox(&mut self.project.codegen.defmt, "").changed() {
                 self.mark_dirty();
             }
             ui.label(RichText::new("DEFMT").monospace());
-            ui.label(dim("RTT logging + panic-probe"));
+            ui.label(dim(if esp { "defmt over espflash (off: log + esp-println)" } else { "RTT logging + panic-probe" }));
         });
         ui.horizontal(|ui| {
             ui.add_enabled(false, egui::Checkbox::without_text(&mut true));
             ui.label(RichText::new("EMBASSY").monospace());
-            ui.label(dim("async executor + time driver (always on)"));
+            ui.label(dim(if esp { "executor + time driver via esp-rtos (always on)" } else { "async executor + time driver (always on)" }));
         });
     }
 
@@ -250,9 +251,11 @@ impl Editor {
         ui.add_space(6.0);
         theme::section(ui, "Parameter Settings");
         egui::Grid::new(("periph_info", &p.name)).num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
-            ui.label(RichText::new("Address").color(theme::TEXT_DIM));
-            ui.label(RichText::new(format!("0x{:08X}", p.address)).monospace());
-            ui.end_row();
+            if p.address != 0 {
+                ui.label(RichText::new("Address").color(theme::TEXT_DIM));
+                ui.label(RichText::new(format!("0x{:08X}", p.address)).monospace());
+                ui.end_row();
+            }
             if let Some(b) = p.rcc.as_ref().and_then(|r| r.bus_clock.as_ref()) {
                 ui.label(RichText::new("Bus").color(theme::TEXT_DIM));
                 ui.label(RichText::new(b).monospace());
@@ -301,7 +304,7 @@ impl Editor {
 
         // Settings for drivers the code generator knows.
         let settings: &[(&str, &str, &str)] = match kind(p).as_str() {
-            "usart" | "lpuart" => &[("baudrate", "Baud rate", "115200")],
+            "usart" | "lpuart" | "uart" => &[("baudrate", "Baud rate", "115200")],
             "spi" => &[("frequency", "SCK frequency (Hz)", "1000000")],
             "i2c" => &[("frequency", "Bus frequency (Hz)", "100000")],
             _ => &[],
