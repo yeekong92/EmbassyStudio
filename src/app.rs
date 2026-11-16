@@ -145,6 +145,8 @@ pub enum Action {
     OpenProject(PathBuf),
     CreateProject { dir: PathBuf, project: Project },
     CloseProject,
+    /// Leave the project for the Hub's new-project form.
+    NewProject,
     Notify(String, bool),
 }
 
@@ -218,6 +220,10 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title("Embassy Studio".into()));
                 self.screen = Screen::Hub(Hub::default());
             }
+            Action::NewProject => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title("Embassy Studio".into()));
+                self.screen = Screen::Hub(Hub::new_project());
+            }
             Action::Notify(text, error) => self.notify(ctx, text, error),
         }
     }
@@ -263,7 +269,7 @@ impl eframe::App for App {
                     self.settings.save();
                 }
             }
-            Screen::Editor(editor) => editor.ui(ui, &mut self.data, &mut actions),
+            Screen::Editor(editor) => editor.ui(ui, &mut self.data, &self.settings.recent, &mut actions),
         }
         for a in actions {
             self.handle(&ctx, a);

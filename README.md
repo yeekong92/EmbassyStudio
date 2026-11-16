@@ -11,9 +11,11 @@ register layout that the clock tree is built from. Nothing chip-specific is hard
 
 - **Project Hub** on launch: recent projects (left), *Open Project* folder picker and the
   *New Project* wizard (name, location, searchable MCU selector, package) on the right.
+- **File menu** in a project: *New Project*, *Open Project*, *Recent Projects* and *Save As*
+  (`Ctrl+Shift+S`), which copies the configuration and the schematic sheets into a new folder.
 - **Pinout**: interactive package drawing for QFP/QFN, SO/TSSOP and BGA/WLCSP. Click a pin to
-  configure it, right-click to assign GPIO or any alternate function, wheel to zoom, drag to pan.
-  Conflicts (e.g. two EXTI pins on one line) are flagged.
+  choose GPIO or any alternate function; the label prompt follows by itself. Wheel to zoom, drag to
+  pan. Conflicts (e.g. two EXTI pins on one line) are flagged.
 - **Schematic**: import your hardware schematic and configure pins where they are drawn. The MCU's
   pins are located from the text of the drawing and an interactive node is placed beside each one;
   see [Schematic overlay](#schematic-overlay).
@@ -49,15 +51,20 @@ Text is cross-referenced against the pin names of the project's package (`PA0`, 
 stored as an SVG in the project's `schematic/` folder and rendered sharply at any zoom.
 
 - **Edit mode** (calibration) opens after an import. Drag a node beside its pin, press `R` to turn its
-  label, `Del` to remove it, and place pins that were not found from the list on the right. *Save*
-  writes the positions to `embassy-studio.json`, relative to the sheet (0–1), so they do not depend
-  on zoom or window size.
+  label, `Del` to remove it, and place pins that were not found from the list on the right.
+  `Ctrl+Z` / `Ctrl+Y` undo and redo. A **snap grid** makes nodes line up: type a pitch in the side
+  panel or pick one (the symbol's pin pitch, half or a quarter of it) there or in the right-click
+  menu; hold `Alt` to place a node off the grid. *Save* writes the positions to
+  `embassy-studio.json`, relative to the sheet (0–1), so they do not depend on zoom or window size.
 - **View mode** is for configuration: nodes are locked and glued to the drawing while you pan and
-  zoom. Click a node to pick the pin's function, right-click for its label. Colours match the Pinout
-  tab; the assigned function is written next to the node, and pins the selected peripheral can use
-  get a ring.
+  zoom. Click a node to pick the pin's function, then type its label in the prompt that follows.
+  Colours match the Pinout tab; the assigned function is written next to the node, and pins the
+  selected peripheral can use get a ring. The side panel lists every pin with its status, function
+  and label; picking a row points the pin out on the schematic.
 
-Importing a sheet again refreshes the drawing and keeps the nodes you calibrated.
+Beside the sheet's name, **Refresh** reads the source file again (the nodes you calibrated stay
+where they are) and **Close** closes the schematic so another one can be imported. The same commands are in the
+menu that opens when you right-click the canvas.
 
 The overlay is purely visual. There is no netlist: wires are not traced, other components are not
 interpreted and nothing is checked against the schematic.

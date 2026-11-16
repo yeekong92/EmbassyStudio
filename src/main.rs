@@ -81,7 +81,8 @@ fn import_schematic_headless(dir: &std::path::Path, file: &std::path::Path) -> a
     let pkg = chip.package(&project.package).or(chip.packages.first()).context("the chip has no package data")?;
     let pins = schematic::PinNames::from_package(pkg);
     let drawings = schematic::import(file, &pins)?;
-    let source = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    // Absolute, so the sheet can be refreshed from the GUI later.
+    let source = std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf());
     let done = schematic::add_to_project(&mut project.schematic, dir, &source, drawings, &pins)?;
     for e in &done.errors {
         eprintln!("could not write {e}");

@@ -4,6 +4,7 @@ mod clock_view;
 mod peripherals;
 mod pinout;
 mod schematic_view;
+mod top_bar;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ use crate::app::{Action, Data, Load};
 use crate::clock::{ClockResults, ClockTree, format_hz};
 use crate::codegen::{self, GenFile, RccFlavor};
 use crate::db::{Chip, PinFunction};
-use crate::project::{PinConfig, PinMode, Project};
+use crate::project::{PinConfig, PinMode, Project, RecentProject};
 use crate::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,7 +43,7 @@ pub struct Editor {
     pin_view: pinout::PinView,
     /// Pinout search (pin names, signals, peripherals, user labels).
     pin_search: String,
-    /// Open pin popup (left-click function list or right-click label editor).
+    /// Open pin popup: the function list, then the label prompt.
     pin_popup: Option<pinout::PinPopup>,
     /// Pan / zoom of the clock tree.
     clock_cam: clock_view::Camera,
@@ -50,6 +51,8 @@ pub struct Editor {
     clock_popup: Option<clock_view::ClockPopup>,
     /// Schematic tab: view, calibration draft and background images.
     sch: schematic_view::SchState,
+    /// Open "Save Project As" dialog.
+    save_as: Option<top_bar::SaveAs>,
     dirty: bool,
     generate_when_ready: bool,
     preview: Vec<GenFile>,
@@ -77,6 +80,7 @@ impl Editor {
             clock_cam: clock_view::Camera::default(),
             clock_popup: None,
             sch: schematic_view::SchState::default(),
+            save_as: None,
             dirty: false,
             generate_when_ready: generate,
             preview: Vec::new(),
@@ -169,7 +173,7 @@ impl Editor {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, data: &mut Data, actions: &mut Vec<Action>) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, data: &mut Data, recent: &[RecentProject], actions: &mut Vec<Action>) {
         self.poll_data(data);
         if self.generate_when_ready && self.chip.is_some() && self.tree.is_some() {
             self.generate_when_ready = false;
@@ -177,20 +181,24 @@ impl Editor {
         }
 
         // Shortcuts
-        let (save, gen_code) = ui.input_mut(|i| {
+        // Ctrl+Shift+S first: Ctrl+S alone would match it too.
+        let (save_as, save, gen_code) = ui.input_mut(|i| {
             (
+                i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
             )
         });
-        if save {
+        if save_as {
+            self.open_save_as();
+        } else if save {
             self.save(actions);
         }
         if gen_code {
             self.generate(actions);
         }
 
-        self.top_bar(ui, actions);
+        self.top_bar(ui, recent, actions);
         self.status_bar(ui);
 
         let Some(chip) = self.chip.clone() else {
@@ -233,8 +241,8 @@ impl Editor {
         if self.tab == Tab::Schematic {
             egui::Panel::right("schematic_inspector")
                 .resizable(true)
-                .default_size(300.0)
-                .min_size(240.0)
+                .default_size(350.0)
+                .min_size(280.0)
                 .show(ui, |ui| self.schematic_panel(ui, &chip));
         }
 
@@ -248,90 +256,13 @@ impl Editor {
             });
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        egui::Panel::top("editor_top")
-            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(12, 8)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                    crate::hub::logo(ui.painter(), rect);
-                    ui.menu_button("File", |ui| {
-                        if ui.button("Save            Ctrl+S").clicked() {
-                            self.save(actions);
-                            ui.close();
-                        }
-                        if ui.button("Generate Code   Ctrl+G").clicked() {
-                            self.generate(actions);
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("Show in Explorer").clicked() {
-                            crate::hub::open_in_explorer(&self.dir);
-                            ui.close();
-                        }
-                        if ui.button("Open in VS Code").clicked() {
-                            let r = std::process::Command::new("cmd")
-                                .args(["/C", "code", "."])
-                                .current_dir(&self.dir)
-                                .spawn();
-                            if r.is_err() {
-                                actions.push(Action::Notify("Could not start VS Code (`code` not on PATH)".into(), true));
-                            }
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("Close Project").clicked() {
-                            self.save_quiet();
-                            actions.push(Action::CloseProject);
-                            ui.close();
-                        }
-                    });
-                    ui.menu_button("Options", |ui| {
-                        let mut changed = ui.checkbox(&mut self.project.codegen.defmt, "Use defmt logging").changed();
-                        changed |= ui.checkbox(&mut self.project.codegen.vscode, "Generate .vscode config").changed();
-                        if changed {
-                            self.mark_dirty();
-                        }
-                    });
-                    ui.separator();
-                    ui.label(RichText::new(&self.project.name).strong().size(15.0).color(theme::TEXT));
-                    ui.label(
-                        RichText::new(format!("{} · {}", self.project.chip, self.project.package))
-                            .monospace()
-                            .color(theme::ACCENT),
-                    );
-                    if self.dirty {
-                        ui.label(RichText::new("●").color(theme::WARN)).on_hover_text("Unsaved changes");
-                    }
-                    ui.add_space(16.0);
-                    for (tab, label) in [(Tab::Pinout, "Pinout"), (Tab::Schematic, "Schematic"), (Tab::Clock, "Clock Configuration"), (Tab::Code, "Code Preview")] {
-                        if ui.selectable_label(self.tab == tab, RichText::new(label).size(14.0)).clicked() {
-                            self.tab = tab;
-                        }
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let ready = self.chip.is_some() && self.tree.is_some();
-                        if ui.add_enabled(ready, theme::primary_button("⚙  Generate Code")).clicked() {
-                            self.generate(actions);
-                        }
-                        if ui.button("Save").clicked() {
-                            self.save(actions);
-                        }
-                        if ui.button("⌂ Hub").on_hover_text("Save and return to the Project Hub").clicked() {
-                            self.save_quiet();
-                            actions.push(Action::CloseProject);
-                        }
-                    });
-                });
-            });
-    }
-
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(12, 4)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let small = |t: String| RichText::new(t).size(11.5).color(theme::TEXT_DIM);
+                    ui.label(small(format!("{} · {}", self.project.chip, self.project.package)));
                     ui.label(small(self.dir.display().to_string()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.tree.is_some() {

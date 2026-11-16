@@ -53,6 +53,12 @@ pub struct Sheet {
     /// What it was imported from (display only).
     #[serde(default)]
     pub source: String,
+    /// Full path of the imported file, so the sheet can be refreshed from it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
+    /// Snap grid used while calibrating, in drawing units (0 = off).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub grid: f32,
     /// Node diameter as a fraction of the sheet width.
     #[serde(default = "default_node_size")]
     pub node_size: f32,
@@ -62,6 +68,10 @@ pub struct Sheet {
 
 fn default_node_size() -> f32 {
     0.006
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 /// Which way a node's label runs, i.e. away from the pin name it sits beside.
@@ -210,7 +220,9 @@ pub struct Imported {
 /// Importing a sheet again refreshes its drawing but keeps the nodes already on
 /// it — they may have been calibrated by hand — and only adds nodes for pins
 /// that had none.
-pub fn add_to_project(config: &mut SchematicConfig, project_dir: &Path, source: &str, drawings: Vec<Drawing>, pins: &PinNames) -> Result<Imported> {
+pub fn add_to_project(config: &mut SchematicConfig, project_dir: &Path, source: &Path, drawings: Vec<Drawing>, pins: &PinNames) -> Result<Imported> {
+    let origin = source.to_string_lossy().to_string();
+    let source = source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     std::fs::create_dir_all(project_dir.join(DIR)).with_context(|| format!("creating the {DIR} folder"))?;
     let mut out = Imported::default();
     let mut most = 0;
@@ -227,11 +239,20 @@ pub fn add_to_project(config: &mut SchematicConfig, project_dir: &Path, source: 
                 let sheet = &mut config.sheets[i];
                 let kept: BTreeSet<String> = sheet.nodes.iter().map(|n| n.pin.clone()).collect();
                 sheet.nodes.extend(located.nodes.into_iter().filter(|n| !kept.contains(&n.pin)));
-                sheet.source = source.to_string();
+                sheet.source = source.clone();
+                sheet.origin = origin.clone();
                 i
             }
             None => {
-                config.sheets.push(Sheet { name: d.name, file: rel.clone(), source: source.to_string(), node_size: located.node_size, nodes: located.nodes });
+                config.sheets.push(Sheet {
+                    name: d.name,
+                    file: rel.clone(),
+                    source: source.clone(),
+                    origin: origin.clone(),
+                    grid: 0.0,
+                    node_size: located.node_size,
+                    nodes: located.nodes,
+                });
                 config.sheets.len() - 1
             }
         };
@@ -601,7 +622,7 @@ mod tests {
         let pins = PinNames::from_package(&pkg);
         let dir = std::env::temp_dir().join(format!("embassy-studio-reimport-{}", std::process::id()));
         let mut config = SchematicConfig::default();
-        let first = add_to_project(&mut config, &dir, "a.svg", vec![symbol()], &pins).unwrap();
+        let first = add_to_project(&mut config, &dir, Path::new("a.svg"), vec![symbol()], &pins).unwrap();
         assert_eq!((first.sheet, first.gpios.len(), config.sheets.len()), (Some(0), 7, 1));
         assert!(dir.join("schematic/t.svg").is_file());
 
@@ -610,7 +631,7 @@ mod tests {
         sheet.nodes.retain(|n| n.pin != "PB6");
         sheet.nodes.iter_mut().find(|n| n.pin == "PA0").unwrap().x = 0.5;
         let count = sheet.nodes.len();
-        add_to_project(&mut config, &dir, "a.svg", vec![symbol()], &pins).unwrap();
+        add_to_project(&mut config, &dir, Path::new("a.svg"), vec![symbol()], &pins).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         let sheet = &config.sheets[0];
         assert_eq!((config.sheets.len(), sheet.nodes.len()), (1, count + 1));
@@ -729,6 +750,8 @@ mod tests {
             name: "MCU".into(),
             file: "schematic/MCU.svg".into(),
             source: "board.pdf".into(),
+            origin: String::new(),
+            grid: 0.0,
             node_size: 0.006,
             nodes: vec![
                 Node { pin: "PA0".into(), x: 0.123456789, y: 0.5, label: LabelDir::Right }.rounded(),

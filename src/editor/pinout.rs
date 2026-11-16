@@ -17,13 +17,13 @@ pub struct PinView {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PinPopupKind {
-    /// Left-click: list the pin's functions (GPIO modes and alternate functions).
+    /// First step: the pin's functions (GPIO modes and alternate functions).
     Functions,
-    /// Right-click: enter a user label.
+    /// Second step, shown by itself once a function is chosen: the user label.
     Label,
 }
 
-/// A popup opened from a pin on the package drawing.
+/// The popup opened by clicking a pin: choose its function, then name it.
 pub struct PinPopup {
     gpio: String,
     kind: PinPopupKind,
@@ -34,8 +34,14 @@ pub struct PinPopup {
 }
 
 impl PinPopup {
-    pub(super) fn new(gpio: String, kind: PinPopupKind, label: String) -> Self {
-        Self { gpio, kind, opening: true, label }
+    /// The function list of a pin; choosing one leads on to the label prompt.
+    pub(super) fn functions(gpio: String) -> Self {
+        Self { gpio, kind: PinPopupKind::Functions, opening: true, label: String::new() }
+    }
+
+    /// The label prompt alone, for a pin that already has a function.
+    pub(super) fn label(gpio: String, label: String) -> Self {
+        Self { gpio, kind: PinPopupKind::Label, opening: true, label }
     }
 }
 
@@ -403,20 +409,9 @@ impl Editor {
         // Interaction
         if let Some(i) = hovered {
             let p = &layout.pins[i];
-            let label = |s: &Self, g: &String| s.project.pins.get(g).map(|c| c.label.clone()).unwrap_or_default();
             if resp.clicked() {
                 self.selected_pin = Some(p.position.clone());
-                self.pin_popup = p.gpio.clone().map(|g| {
-                    let l = label(self, &g);
-                    PinPopup::new(g, PinPopupKind::Functions, l)
-                });
-            }
-            if resp.secondary_clicked() {
-                self.selected_pin = Some(p.position.clone());
-                self.pin_popup = p.gpio.clone().map(|g| {
-                    let l = label(self, &g);
-                    PinPopup::new(g, PinPopupKind::Label, l)
-                });
+                self.pin_popup = p.gpio.clone().map(PinPopup::functions);
             }
             if self.pin_popup.is_none() {
                 let mut tip = format!("Pin {}  ·  {}", p.position, p.signals.join(" / "));
@@ -428,7 +423,7 @@ impl Editor {
                 }
                 resp.clone().on_hover_text_at_pointer(tip);
             }
-        } else if resp.clicked() || resp.secondary_clicked() {
+        } else if resp.clicked() {
             self.selected_pin = None;
             self.pin_popup = None;
         }
@@ -438,7 +433,7 @@ impl Editor {
         painter.text(
             rect.left_bottom() + vec2(10.0, -10.0),
             Align2::LEFT_BOTTOM,
-            "Left-click: pin functions  ·  Right-click: user label  ·  Wheel: zoom  ·  Drag: pan  ·  Double-click: reset view",
+            "Click a pin: choose its function, then name it  ·  Wheel: zoom  ·  Drag: pan  ·  Double-click: reset view",
             FontId::proportional(11.0),
             theme::TEXT_DIM,
         );
@@ -459,15 +454,17 @@ impl Editor {
         self.pin_functions.get(g).is_some_and(|fs| fs.iter().any(|f| f.label().contains(token)))
     }
 
-    /// The open pin popup: function list (left-click) or label editor (right-click).
+    /// The open pin popup. Choosing a function moves straight on to the label
+    /// prompt, so one click on a pin sets it up completely.
     pub(super) fn show_pin_popup(&mut self, ui: &mut egui::Ui) {
         let Some(mut pp) = self.pin_popup.take() else { return };
         let id = egui::Id::unique(("pin_popup", &pp.gpio, pp.kind));
         let opening = std::mem::take(&mut pp.opening);
         let gpio = pp.gpio.clone();
-        let mut keep = true;
+        let assigned = self.project.pins.get(&gpio).map(|c| c.mode.label());
         let mut choice: Option<Option<PinMode>> = None;
         let mut new_label: Option<String> = None;
+        let (mut to_label, mut close) = (false, false);
 
         let shown = egui::Popup::new(id, ui.ctx().clone(), egui::PopupAnchor::PointerFixed, ui.layer_id())
             .kind(egui::PopupKind::Menu)
@@ -478,49 +475,48 @@ impl Editor {
             .show(|ui| match pp.kind {
                 PinPopupKind::Functions => {
                     ui.set_min_width(230.0);
-                    ui.label(RichText::new(&gpio).strong().color(theme::ACCENT));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&gpio).strong().color(theme::ACCENT));
+                        if assigned.is_some() {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                to_label = ui.small_button("Label…").on_hover_text("Keep the function and edit the user label").clicked();
+                            });
+                        }
+                    });
                     ui.separator();
                     choice = self.pin_function_list(ui, &gpio);
                 }
                 PinPopupKind::Label => {
                     ui.set_min_width(260.0);
-                    ui.label(RichText::new(format!("{gpio}  ·  Enter User Label")).strong().color(theme::ACCENT));
+                    ui.label(RichText::new(format!("{gpio}  ·  {}", assigned.as_deref().unwrap_or("Reset_State"))).strong().color(theme::ACCENT));
                     ui.separator();
-                    if self.project.pins.contains_key(&gpio) {
-                        let r = ui.add(egui::TextEdit::singleline(&mut pp.label).hint_text("e.g. LED_GREEN").desired_width(240.0));
-                        if opening {
-                            r.request_focus();
+                    ui.label(RichText::new("User label").color(theme::TEXT_DIM));
+                    let r = ui.add(egui::TextEdit::singleline(&mut pp.label).hint_text("e.g. LED_GREEN").desired_width(240.0));
+                    if opening {
+                        r.request_focus();
+                    }
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() || enter {
+                            new_label = Some(pp.label.trim().to_string());
                         }
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        ui.horizontal(|ui| {
-                            if ui.button("OK").clicked() || enter {
-                                new_label = Some(pp.label.trim().to_string());
-                            }
-                            if ui.button("Clear label").clicked() {
-                                new_label = Some(String::new());
-                            }
-                        });
-                        ui.label(RichText::new("Names the pin in the generated board.rs.").size(11.0).color(theme::TEXT_DIM));
-                    } else {
-                        ui.label(
-                            RichText::new("Assign a function first (left-click the pin); the label names it in generated code.")
-                                .size(12.0)
-                                .color(theme::TEXT_DIM),
-                        );
-                    }
-                    ui.separator();
-                    if ui.button("Reset_State").clicked() {
-                        choice = Some(None);
-                    }
+                        close = ui.button("Skip").on_hover_text("Leave the label as it is").clicked();
+                    });
+                    ui.label(RichText::new("Names the pin in the generated board.rs. Leave it empty for no label.").size(11.0).color(theme::TEXT_DIM));
                 }
             });
 
-        if shown.is_none() {
-            keep = false;
-        }
-        if let Some(mode) = choice {
-            self.assign_pin(&gpio, mode);
-            keep = false;
+        close |= shown.is_none() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+        match choice {
+            Some(Some(mode)) => {
+                self.assign_pin(&gpio, Some(mode));
+                to_label = true;
+            }
+            Some(None) => {
+                self.assign_pin(&gpio, None);
+                close = true;
+            }
+            None => {}
         }
         if let Some(l) = new_label {
             if let Some(cfg) = self.project.pins.get_mut(&gpio) {
@@ -529,12 +525,19 @@ impl Editor {
                     self.mark_dirty();
                 }
             }
-            keep = false;
+            close = true;
         }
-        if keep {
-            self.pin_popup = Some(pp);
-        } else {
+        if to_label {
+            // Next step: the label prompt, opened where the pointer is now.
             egui::Popup::close_id(ui.ctx(), id);
+            pp.kind = PinPopupKind::Label;
+            pp.opening = true;
+            pp.label = self.project.pins.get(&gpio).map(|c| c.label.clone()).unwrap_or_default();
+            self.pin_popup = Some(pp);
+        } else if close {
+            egui::Popup::close_id(ui.ctx(), id);
+        } else {
+            self.pin_popup = Some(pp);
         }
     }
 

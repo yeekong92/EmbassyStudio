@@ -18,9 +18,16 @@ pub struct Hub {
     chip: Option<String>,
     package: Option<String>,
     error: Option<String>,
+    /// Put the keyboard focus in the project name box.
+    focus_name: bool,
 }
 
 impl Hub {
+    /// The Hub, ready for typing a new project's name.
+    pub fn new_project() -> Self {
+        Self { focus_name: true, ..Self::default() }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, data: &mut Data, settings: &mut Settings, actions: &mut Vec<Action>) {
         if self.location.is_none() {
             self.location = settings
@@ -205,11 +212,14 @@ impl Hub {
                 .min_col_width(130.0)
                 .show(ui, |ui| {
                     ui.label(RichText::new("Project name").color(theme::TEXT_DIM));
-                    ui.add(
+                    let name = ui.add(
                         egui::TextEdit::singleline(&mut self.name)
                             .hint_text("my-firmware")
                             .desired_width(f32::INFINITY),
                     );
+                    if std::mem::take(&mut self.focus_name) {
+                        name.request_focus();
+                    }
                     ui.end_row();
 
                     ui.label(RichText::new("Location").color(theme::TEXT_DIM));

@@ -2,6 +2,8 @@
 
 use egui::{Color32, CornerRadius, Stroke, Visuals};
 
+/// The window's title strip, behind the view tabs.
+pub const TITLE: Color32 = Color32::from_rgb(0x0e, 0x10, 0x14);
 pub const BG: Color32 = Color32::from_rgb(0x16, 0x18, 0x1d);
 pub const PANEL: Color32 = Color32::from_rgb(0x1d, 0x20, 0x26);
 pub const CARD: Color32 = Color32::from_rgb(0x24, 0x28, 0x30);
